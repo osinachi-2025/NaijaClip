@@ -175,6 +175,13 @@ def reset_password_page(request: Request):
         context={"request": request, "reset_page": "reset"},
     )
 
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "service": "NaijaClip",
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
 
 from app.main import cancel_video, create_video_job, delete_video, get_job, health, list_clips, list_videos
 
