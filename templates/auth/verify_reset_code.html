@@ -1,0 +1,22 @@
+{% extends "auth/reset_base.html" %}
+{% block page_title %}Verify reset code{% endblock %}
+{% block heading %}Enter verification code{% endblock %}
+{% block introduction %}Enter the six-digit code we sent to this email address. It expires in 10 minutes.{% endblock %}
+{% block content %}
+  <form id="verify-reset-form" class="nc-reset-form">
+    <div class="nc-reset-field">
+      <label for="reset-email">Email address</label>
+      <input id="reset-email" type="email" autocomplete="email" required />
+    </div>
+    <div class="nc-otp" role="group" aria-label="Six-digit verification code">
+      {% for digit in range(1, 7) %}
+      <input class="nc-otp-digit" aria-label="Digit {{ digit }}" inputmode="numeric" pattern="[0-9]*" maxlength="1" autocomplete="{% if digit == 1 %}one-time-code{% else %}off{% endif %}" required />
+      {% endfor %}
+    </div>
+    <button class="nc-btn nc-btn-primary nc-btn-full" type="submit">Verify code</button>
+  </form>
+  <div class="nc-resend-row">
+    <button id="resend-reset-code" class="nc-link-btn" type="button" disabled>Resend code</button>
+    <span id="resend-countdown" aria-live="polite">Resend code in 45 seconds</span>
+  </div>
+{% endblock %}

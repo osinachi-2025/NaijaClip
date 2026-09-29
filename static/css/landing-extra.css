@@ -1,0 +1,212 @@
+/* ============================================================
+   Landing extras — stats, features, testimonials, faq, footer
+   Built against the existing NaijaClip design tokens in styles.css
+   ============================================================ */
+
+html { scroll-behavior: smooth; scroll-padding-top: 76px; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+.nc-lx-head { max-width: 620px; margin: 0 auto 40px; text-align: center; }
+.nc-lx-head h2 { font-size: 26px; font-weight: 700; margin: 0 0 10px; }
+.nc-lx-head p { color: var(--ink-soft); margin: 0; line-height: 1.6; font-size: 15px; }
+
+/* ---------- Stats strip ---------- */
+.nc-lx-stats { background: var(--surface); border-block: 1px solid var(--border); }
+.nc-lx-stats-inner {
+  max-width: 1120px; margin: 0 auto; padding: 36px 20px;
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px;
+}
+.nc-lx-stats-inner > div { text-align: center; padding: 0 12px; border-left: 1px solid var(--border); }
+.nc-lx-stats-inner > div:first-child { border-left: none; }
+.nc-lx-stat-n { font-size: 30px; font-weight: 700; color: var(--ink); line-height: 1; margin-bottom: 8px; }
+.nc-lx-stat-l { font-size: 12.5px; color: var(--muted); line-height: 1.5; max-width: 20ch; margin: 0 auto; }
+
+/* ---------- Features ---------- */
+.nc-lx-features {
+  display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
+  max-width: 1120px; margin: 0 auto;
+}
+.nc-lx-feature {
+  padding: 26px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+}
+.nc-lx-feature:hover {
+  transform: translateY(-3px);
+  border-color: var(--accent-soft);
+  box-shadow: 0 20px 40px -24px rgba(20, 23, 26, 0.28);
+}
+.nc-lx-ficon {
+  width: 42px; height: 42px; border-radius: var(--radius-md);
+  background: linear-gradient(160deg, #2A2F35, var(--ink));
+  color: #fff; display: flex; align-items: center; justify-content: center;
+  margin-bottom: 18px;
+}
+.nc-lx-feature h3 { font-size: 16.5px; font-weight: 700; margin: 0 0 8px; color: var(--ink); }
+.nc-lx-feature p { margin: 0; color: var(--ink-soft); font-size: 14px; line-height: 1.6; }
+
+/* ---------- Testimonials ---------- */
+.nc-lx-quotes { background: var(--bg-alt); }
+.nc-lx-quote-grid {
+  display: grid; grid-template-columns: 1.25fr 1fr 1fr; gap: 18px;
+  max-width: 1120px; margin: 0 auto; align-items: stretch;
+}
+.nc-lx-quote {
+  margin: 0; padding: 26px 24px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  position: relative;
+  display: flex; flex-direction: column; justify-content: space-between;
+  box-shadow: 0 20px 50px -34px rgba(20, 23, 26, 0.25);
+}
+.nc-lx-quote::before {
+  content: "\201C";
+  position: absolute; top: 10px; left: 20px;
+  font-family: 'Space Grotesk', sans-serif; font-size: 44px; line-height: 1;
+  color: var(--accent); opacity: 0.28;
+}
+.nc-lx-quote blockquote {
+  margin: 22px 0 18px; font-size: 15.5px; line-height: 1.6; font-weight: 500; color: var(--ink);
+}
+.nc-lx-quote:first-child blockquote { font-size: 18px; }
+.nc-lx-quote figcaption { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); }
+.nc-lx-quote figcaption::before {
+  content: ""; width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+  background: linear-gradient(135deg, var(--accent), var(--teal));
+}
+.nc-lx-quote figcaption b { color: var(--ink); font-weight: 700; display: block; font-size: 13.5px; }
+
+/* ---------- FAQ ---------- */
+.nc-lx-faq { max-width: 720px; margin: 0 auto; }
+.nc-faq-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  margin-bottom: 10px;
+  overflow: hidden;
+  background: var(--surface);
+  transition: border-color 0.15s ease;
+}
+.nc-faq-item.open { border-color: var(--accent-soft); }
+.nc-faq-q {
+  width: 100%; display: flex; justify-content: space-between; align-items: center; gap: 16px;
+  padding: 17px 20px; background: none; border: 0; font: inherit; font-size: 15px; font-weight: 600;
+  text-align: left; cursor: pointer; color: var(--ink);
+}
+.nc-faq-plus { position: relative; width: 15px; height: 15px; flex-shrink: 0; color: var(--muted); }
+.nc-faq-plus::before, .nc-faq-plus::after {
+  content: ""; position: absolute; background: currentColor; inset: 6.5px 0 auto 0; height: 2px; border-radius: 2px;
+  transition: transform 0.2s ease;
+}
+.nc-faq-plus::after { transform: rotate(90deg); }
+.nc-faq-item.open .nc-faq-plus { color: var(--accent); }
+.nc-faq-item.open .nc-faq-plus::after { transform: rotate(0); }
+.nc-faq-a { display: grid; grid-template-rows: 0fr; transition: grid-template-rows 0.22s ease; }
+.nc-faq-a > p { overflow: hidden; margin: 0; padding: 0 20px; color: var(--ink-soft); line-height: 1.65; font-size: 14px; }
+.nc-faq-item.open .nc-faq-a { grid-template-rows: 1fr; }
+.nc-faq-item.open .nc-faq-a > p { padding-bottom: 18px; }
+@media (prefers-reduced-motion: reduce) { .nc-faq-a, .nc-faq-plus::after { transition: none; } }
+
+/* ---------- Featured homepage clips ---------- */
+.nc-featured-clip-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 18px;
+  margin-top: 26px;
+}
+.nc-featured-clip-card { min-width: 0; }
+.nc-featured-clip-placeholder .nc-featured-video-frame {
+  display: grid;
+  place-items: center;
+  border-style: dashed;
+  border-color: rgba(255, 255, 255, 0.28);
+  background: linear-gradient(155deg, #252b2d, #111617);
+}
+.nc-featured-placeholder-content {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  padding: 18px;
+  color: rgba(255, 255, 255, 0.68);
+  text-align: center;
+  font-size: 13px;
+}
+.nc-featured-placeholder-icon {
+  width: 48px;
+  height: 48px;
+  display: grid;
+  place-items: center;
+  border: 1px solid rgba(255, 255, 255, 0.32);
+  border-radius: 50%;
+  color: #fff;
+}
+.nc-featured-video-frame {
+  overflow: hidden;
+  aspect-ratio: 9 / 16;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 12px;
+  background: #101416;
+}
+.nc-featured-video-frame video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.nc-featured-clip-caption {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
+  padding-top: 10px;
+  color: #fff;
+}
+.nc-featured-clip-caption h3 {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 14px;
+  font-weight: 600;
+}
+.nc-featured-clip-caption span {
+  flex: 0 0 auto;
+  color: rgba(255, 255, 255, 0.68);
+  font-size: 12px;
+}
+
+/* ---------- Footer ---------- */
+.nc-lx-footer {
+  max-width: 1120px; margin: 0 auto; padding: 52px 20px 28px;
+  display: grid; grid-template-columns: 1.6fr 1fr 1fr 1fr; gap: 28px;
+}
+.nc-lx-fbrand p { color: var(--muted); max-width: 30ch; line-height: 1.6; font-size: 13.5px; margin-top: 12px; }
+.nc-lx-ftitle { font-weight: 700; margin-bottom: 12px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+.nc-lx-flink {
+  display: block; background: none; border: 0; padding: 5px 0; font: inherit; font-size: 14px;
+  color: var(--ink-soft); cursor: pointer; text-align: left; transition: color 0.15s ease;
+}
+.nc-lx-flink:hover { color: var(--accent-dark); }
+.nc-lx-fbottom {
+  max-width: 1120px; margin: 0 auto; padding: 20px 20px 32px;
+  display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  border-top: 1px solid var(--border);
+}
+
+/* ---------- Responsive ---------- */
+@media (max-width: 980px) {
+  .nc-lx-quote-grid { grid-template-columns: 1fr 1fr; }
+  .nc-lx-quote:first-child { grid-column: 1 / -1; }
+}
+@media (max-width: 860px) {
+  .nc-lx-stats-inner { grid-template-columns: repeat(2, 1fr); row-gap: 28px; }
+  .nc-lx-stats-inner > div:nth-child(3) { border-left: none; }
+  .nc-lx-features { grid-template-columns: 1fr 1fr; }
+  .nc-lx-quote-grid { grid-template-columns: 1fr; }
+  .nc-lx-footer { grid-template-columns: 1fr 1fr; }
+  .nc-lx-fbrand { grid-column: 1 / -1; }
+}
+@media (max-width: 560px) {
+  .nc-lx-stats-inner { grid-template-columns: 1fr 1fr; }
+  .nc-lx-features { grid-template-columns: 1fr; }
+}

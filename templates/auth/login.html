@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NaijaClip | Login</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="icon" type="image/png" href="/static/favicon%20image/favicon-512.png" />
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/favicon%20image/favicon-512.png" />
+    <link rel="icon" type="image/png" sizes="192x192" href="/static/favicon%20image/favicon-512.png" />
+    <link rel="stylesheet" href="/static/css/styles.css" />
+    <style>
+      body {
+        background: linear-gradient(180deg, #fffaf7 0%, #f5f2ec 100%);
+      }
+      .nc-auth-page {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 32px 20px;
+      }
+      .nc-auth-card {
+        width: min(100%, 440px);
+        background: rgba(255,255,255,0.9);
+        border: 1px solid var(--border);
+        border-radius: 20px;
+        box-shadow: 0 24px 60px rgba(20,23,26,0.08);
+        padding: 28px 24px;
+      }
+      .nc-auth-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 20px;
+      }
+      .nc-auth-title {
+        font-size: 32px;
+        font-weight: 700;
+        margin: 0;
+      }
+      .nc-auth-badge {
+        font-size: 12px;
+        background: var(--teal-soft);
+        color: var(--teal);
+        border-radius: 999px;
+        padding: 8px 10px;
+        font-weight: 700;
+      }
+      .nc-social-auth {
+        margin: 18px 0 20px;
+      }
+      .nc-google-btn {
+        width: 100%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 12px;
+        background: linear-gradient(135deg, rgba(255,255,255,0.94), rgba(245,247,250,0.9));
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        color: var(--ink);
+        border-radius: 14px;
+        padding: 14px 18px;
+        font-weight: 700;
+        font-size: 15px;
+        transition: transform 0.15s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+        box-shadow: 0 12px 24px rgba(15, 23, 42, 0.08);
+        cursor: pointer;
+      }
+      .nc-google-btn:hover {
+        transform: translateY(-1px);
+        border-color: rgba(96, 165, 250, 0.35);
+        box-shadow: 0 16px 32px rgba(59, 130, 246, 0.12);
+      }
+      .nc-google-btn {
+        width: 100%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        background: linear-gradient(180deg, #ffffff 0%, #f7f8fa 100%);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        color: var(--ink);
+        border-radius: 12px;
+        padding: 13px 18px;
+        font-weight: 600;
+        font-size: 15px;
+        letter-spacing: -0.01em;
+        transition: transform 0.15s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+        box-shadow: 0 8px 18px rgba(15, 23, 42, 0.05);
+        cursor: pointer;
+      }
+      .nc-google-btn:hover {
+        transform: translateY(-1px);
+        border-color: rgba(59, 130, 246, 0.2);
+        box-shadow: 0 12px 24px rgba(99, 102, 241, 0.08);
+      }
+      .nc-google-label {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        position: relative;
+        z-index: 1;
+      }
+      .nc-google-word {
+        background: linear-gradient(90deg, #4285F4 0%, #34A853 25%, #FBBC05 50%, #EA4335 75%, #4285F4 100%);
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+      }
+      .nc-auth-divider {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        margin: 4px 0 20px;
+        color: var(--ink-soft);
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+      }
+      .nc-auth-divider::before,
+      .nc-auth-divider::after {
+        content: "";
+        height: 1px;
+        flex: 1;
+        background: linear-gradient(90deg, transparent, var(--border), transparent);
+      }
+      .nc-auth-form {
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      .nc-field {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .nc-field label {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--ink-soft);
+      }
+      .nc-field input {
+        width: 100%;
+        border: 1px solid var(--border);
+        background: #fff;
+        height: 48px;
+        border-radius: 12px;
+        padding: 0 14px;
+        font-size: 15px;
+        color: var(--ink);
+      }
+      .nc-field input:focus {
+        outline: 2px solid rgba(255, 90, 54, 0.15);
+        border-color: var(--accent);
+      }
+      .nc-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        font-size: 14px;
+      }
+      .nc-checkbox {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        color: var(--ink-soft);
+      }
+      .nc-checkbox input {
+        accent-color: var(--accent);
+      }
+      .nc-link-btn {
+        background: none;
+        border: none;
+        color: var(--accent);
+        font-weight: 600;
+        cursor: pointer;
+        padding: 0;
+        text-decoration: none;
+      }
+      .nc-auth-actions {
+        margin-top: 8px;
+      }
+      .nc-auth-footer {
+        margin-top: 20px;
+        text-align: center;
+        font-size: 14px;
+        color: var(--ink-soft);
+      }
+      .nc-auth-footer a {
+        color: var(--accent);
+        font-weight: 600;
+      }
+      .nc-loader {
+        width: 16px;
+        height: 16px;
+        border: 2px solid rgba(255,255,255,0.4);
+        border-top-color: #fff;
+        border-radius: 50%;
+        display: inline-block;
+        animation: nc-spin 0.75s linear infinite;
+      }
+      @keyframes nc-spin {
+        to { transform: rotate(360deg); }
+      }
+      .nc-toast {
+        position: fixed;
+        left: 50%;
+        bottom: 24px;
+        transform: translateX(-50%);
+        min-width: min(90vw, 360px);
+        max-width: min(92vw, 420px);
+        padding: 12px 16px;
+        border-radius: 12px;
+        background: rgba(20,23,26,0.96);
+        color: #fff;
+        font-size: 14px;
+        font-weight: 600;
+        box-shadow: 0 18px 32px rgba(15,23,42,0.18);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s ease, transform 0.2s ease;
+        z-index: 50;
+      }
+      .nc-toast.show {
+        opacity: 1;
+        transform: translate(-50%, 0);
+      }
+      .nc-toast.success {
+        background: rgba(9, 112, 83, 0.95);
+      }
+      .nc-toast.error {
+        background: rgba(148, 40, 28, 0.95);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="nc-auth-page">
+      <section class="nc-auth-card">
+        <div class="nc-auth-header">
+          <div class="nc-logo" onclick="window.location.href='/'">
+            <span class="nc-logo-mark">✂</span>
+            <span class="nc-logo-text nc-display">Naija<span>Clip</span></span>
+          </div>
+          <span class="nc-auth-badge">Login</span>
+        </div>
+
+        <h1 class="nc-auth-title nc-display">Welcome back</h1>
+
+        <div class="nc-social-auth">
+          <button type="button" class="nc-google-btn" aria-label="Continue with Google">
+            <span class="nc-google-label"><span>Continue with</span> <span class="nc-google-word">Google</span></span>
+          </button>
+        </div>
+
+        <div class="nc-auth-divider">or</div>
+
+        <form id="nc-login-form" class="nc-auth-form">
+          <div class="nc-field">
+            <label for="email">Email</label>
+            <input id="email" type="email" placeholder="you@example.com" required />
+          </div>
+
+          <div class="nc-field">
+            <label for="password">Password</label>
+            <input id="password" type="password" placeholder="Enter your password" required />
+          </div>
+
+          <div class="nc-row">
+            <label class="nc-checkbox">
+              <input type="checkbox" />
+              <span>Remember me</span>
+            </label>
+            <div style="display:grid;gap:6px;text-align:right">
+              <a href="/forgot-password" class="nc-link-btn">Forgot password?</a>
+            </div>
+          </div>
+
+          <div class="nc-auth-actions">
+            <button class="nc-btn nc-btn-primary nc-btn-full" type="submit">Log in</button>
+          </div>
+        </form>
+
+        <div class="nc-auth-footer">
+          Don’t have an account? <a href="/register">Create one</a>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/js/auth.js"></script>
+    <script>
+      const googleBtn = document.querySelector('.nc-google-btn');
+      const form = document.getElementById('nc-login-form');
+      const submitButton = form?.querySelector('button[type="submit"]');
+
+      const notice = new URLSearchParams(window.location.search).get('notice');
+      if (notice === 'verification') showToast('Your account was created. Check your email to verify it.', 'success');
+      if (notice === 'verification-retry') showToast('Your account was created, but the verification email could not be sent. Contact support for help.', 'error');
+      if (notice === 'verified') {
+        showToast(new URLSearchParams(window.location.search).get('welcome') === 'sent'
+          ? 'Email verified. Your welcome email is on its way; you can now sign in.'
+          : 'Email verified. You can now sign in.', 'success');
+      }
+
+      authFetch('/users/me').then((response) => {
+        if (response.ok) window.location.replace('/dashboard');
+      }).catch(() => {});
+
+      function showToast(message, type = 'success') {
+        let toast = document.getElementById('nc-toast');
+        if (!toast) {
+          toast = document.createElement('div');
+          toast.id = 'nc-toast';
+          toast.className = 'nc-toast';
+          document.body.appendChild(toast);
+        }
+        toast.textContent = message;
+        toast.className = `nc-toast show ${type}`;
+        window.clearTimeout(showToast.timeoutId);
+        showToast.timeoutId = window.setTimeout(() => {
+          toast.classList.remove('show');
+        }, 3200);
+      }
+
+      function setLoading(button, isLoading, label) {
+        if (!button) return;
+        button.disabled = isLoading;
+        button.dataset.originalText = button.dataset.originalText || button.textContent;
+        button.innerHTML = isLoading
+          ? `<span class="nc-loader" aria-hidden="true"></span> <span>${label}</span>`
+          : button.dataset.originalText;
+      }
+
+      if (googleBtn) {
+        googleBtn.addEventListener('click', () => {
+          window.location.href = '/auth/google';
+        });
+      }
+
+      form?.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const email = document.getElementById('email').value.trim();
+        const password = document.getElementById('password').value;
+
+        if (!email || !password) {
+          showToast('Please enter both email and password.', 'error');
+          return;
+        }
+
+        setLoading(submitButton, true, 'Logging in...');
+
+        try {
+          const response = await fetch('/auth/login', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({ email, password })
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            showToast(data.detail || 'Login failed. Please try again.', 'error');
+            return;
+          }
+          clearLegacyAuthentication();
+          showToast('Login successful. Redirecting...', 'success');
+          window.setTimeout(() => window.location.href = '/dashboard', 500);
+        } catch (error) {
+          showToast('Unable to reach the server right now.', 'error');
+        } finally {
+          setLoading(submitButton, false, 'Log in');
+        }
+      });
+
+    </script>
+  </body>
+</html>

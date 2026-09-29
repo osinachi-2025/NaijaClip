@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NaijaClip | {% block page_title %}{% endblock %}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="icon" type="image/png" href="/static/favicon%20image/favicon-512.png" />
+    <link rel="stylesheet" href="/static/css/styles.css" />
+    <link rel="stylesheet" href="/static/css/auth-reset.css" />
+  </head>
+  <body>
+    <main class="nc-auth-page" data-reset-page="{{ reset_page }}">
+      <section class="nc-auth-card">
+        <header class="nc-auth-header">
+          <a class="nc-logo" href="/" aria-label="NaijaClip home">
+            <span class="nc-logo-mark">✂</span>
+            <span class="nc-logo-text nc-display">Naija<span>Clip</span></span>
+          </a>
+          <span class="nc-auth-badge">Account recovery</span>
+        </header>
+        <div class="nc-auth-content">
+          <h1 class="nc-auth-title nc-display">{% block heading %}{% endblock %}</h1>
+          <p class="nc-auth-copy">{% block introduction %}{% endblock %}</p>
+          {% block content %}{% endblock %}
+          <p id="reset-status" class="nc-reset-status" role="status" aria-live="polite" hidden></p>
+          <footer class="nc-auth-footer"><a href="/login">Back to login</a></footer>
+        </div>
+      </section>
+    </main>
+    <script src="/static/js/password-reset.js" defer></script>
+  </body>
+</html>

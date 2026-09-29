@@ -1,0 +1,2 @@
+renderDashboard();
+loadDashboardData();
