@@ -96,10 +96,13 @@ if AUTH_COOKIE_SAMESITE == "none" and not AUTH_COOKIE_SECURE:
 AUTH_COOKIE_DOMAIN = os.getenv("AUTH_COOKIE_DOMAIN") or None
 AUTH_ACCESS_COOKIE_NAME = "naijaclip_access"
 AUTH_REFRESH_COOKIE_NAME = "naijaclip_refresh"
-CORS_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ORIGINS", f"{FRONTEND_URL},http://localhost:3000,http://localhost:5173,http://localhost:8000").split(",") if origin.strip()]
+CORS_ORIGINS = [origin.strip() for origin in os.getenv("CORS_ORIGINS", FRONTEND_URL).split(",") if origin.strip()]
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+GOOGLE_REDIRECT_URI = os.getenv(
+    "GOOGLE_REDIRECT_URI",
+    "https://naijaclip.name.ng/api/auth/google/callback",
+)
 RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
 MAIL_FROM_EMAIL = (os.getenv("MAIL_FROM_EMAIL") or "admin@naijaclip.name.ng").strip()
 MAIL_FROM_NAME = (os.getenv("MAIL_FROM_NAME") or "NaijaClip").strip()
