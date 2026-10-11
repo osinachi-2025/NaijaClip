@@ -7,14 +7,14 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 import models
 from core.config import STORAGE_BACKEND
 from integrations.ffmpeg import FFmpeg
 from integrations.storage import LocalStorage, R2Storage
-from services.jobs import update_job
+from services.jobs import JobClaimLost, update_job
 from services.subtitles import SUBTITLE_FORCE_STYLE, SUBTITLE_MAX_WIDTH_EM, build_srt, subtitle_width_em
 
 
@@ -208,7 +208,7 @@ def render_clip_edit(
     return normalized
 
 
-def process_clip_export(db: Session, job_id: str) -> None:
+def process_clip_export(db: Session, job_id: str, *, worker_id: str | None = None) -> None:
     job = db.get(models.ProcessingJob, job_id)
     if job is None or job.job_type != models.JobType.CLIP_RENDER:
         raise LookupError("clip export job not found")
@@ -224,7 +224,7 @@ def process_clip_export(db: Session, job_id: str) -> None:
     storage = R2Storage() if STORAGE_BACKEND == "r2" else LocalStorage()
     work_dir = Path("/tmp") / "naijaclip" / job.id
     work_dir.mkdir(parents=True, exist_ok=True)
-    update_job(db, job.id, status=models.JobStatus.INGESTING, stage="editor_source", progress=10)
+    update_job(db, job.id, status=models.JobStatus.INGESTING, stage="editor_source", progress=10, worker_id=worker_id)
     if not storage.exists(source_key):
         raise FileNotFoundError("source clip is missing from storage")
     if STORAGE_BACKEND == "r2":
@@ -233,13 +233,13 @@ def process_clip_export(db: Session, job_id: str) -> None:
         source = storage.path_for(source_key)
 
     output = work_dir / "edited.mp4"
-    update_job(db, job.id, status=models.JobStatus.RENDERING, stage="editor_rendering", progress=35)
+    update_job(db, job.id, status=models.JobStatus.RENDERING, stage="editor_rendering", progress=35, worker_id=worker_id)
     duration = float(clip.end_seconds - clip.start_seconds)
     normalized = render_clip_edit(source, output, clip_export.edit_configuration or {}, duration)
     clip_export.edit_configuration = normalized
 
     key = f"exports/{video.user_id}/{video.id}/edited/{clip.id}/{clip_export.id}.mp4"
-    update_job(db, job.id, status=models.JobStatus.EXPORTING, stage="editor_upload", progress=85)
+    update_job(db, job.id, status=models.JobStatus.EXPORTING, stage="editor_upload", progress=85, worker_id=worker_id)
     with output.open("rb") as rendered_file:
         if hasattr(storage, "client"):
             storage.client.upload_fileobj(rendered_file, storage.bucket, key, ExtraArgs={"ContentType": "video/mp4"})
@@ -250,14 +250,41 @@ def process_clip_export(db: Session, job_id: str) -> None:
                 shutil.copyfileobj(rendered_file, destination_file)
 
     now = datetime.now(timezone.utc)
+    if worker_id is not None:
+        completed = db.execute(
+            update(models.ProcessingJob)
+            .where(
+                models.ProcessingJob.id == job.id,
+                models.ProcessingJob.worker_id == worker_id,
+                models.ProcessingJob.status.notin_({
+                    models.JobStatus.COMPLETED,
+                    models.JobStatus.FAILED,
+                    models.JobStatus.CANCELLED,
+                    models.JobStatus.CANCELED,
+                }),
+                models.ProcessingJob.cancelled_at.is_(None),
+            )
+            .values(
+                status=models.JobStatus.COMPLETED,
+                current_stage="completed",
+                progress=100,
+                completed_at=now,
+                last_heartbeat_at=now,
+            )
+        )
+        if completed.rowcount != 1:
+            db.rollback()
+            raise JobClaimLost(f"processing job {job.id} is no longer owned by {worker_id}")
+
     clip_export.status = models.ExportStatus.COMPLETED
     clip_export.output_storage_key = key
     clip_export.output_url = storage.url_for(key)
     clip_export.file_size_bytes = output.stat().st_size
     clip_export.error_message = None
     clip_export.completed_at = now
-    job.status = models.JobStatus.COMPLETED
-    job.current_stage = "completed"
-    job.progress = 100
-    job.completed_at = now
+    if worker_id is None:
+        job.status = models.JobStatus.COMPLETED
+        job.current_stage = "completed"
+        job.progress = 100
+        job.completed_at = now
     db.commit()

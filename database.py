@@ -74,6 +74,11 @@ def _ensure_legacy_schema_compatibility() -> None:
                 "retryable": "BOOLEAN NOT NULL DEFAULT 0",
                 "last_heartbeat_at": "DATETIME",
                 "cancelled_at": "DATETIME",
+                "dispatch_token": "VARCHAR(36)",
+                "dispatch_lease_until": "DATETIME",
+                "dispatch_retry_at": "DATETIME",
+                "dispatch_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "dispatch_published_at": "DATETIME",
             }.items():
                 if column_name not in processing_columns:
                     conn.execute(text(f"ALTER TABLE processing_jobs ADD COLUMN {column_name} {definition}"))

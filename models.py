@@ -812,6 +812,16 @@ class ProcessingJob(Base):
         index=True,
     )
 
+    dispatch_token: Mapped[Optional[str]] = mapped_column(String(36))
+
+    dispatch_lease_until: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    dispatch_retry_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
+    dispatch_attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    dispatch_published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     worker_id: Mapped[Optional[str]] = mapped_column(
         String(255)
     )

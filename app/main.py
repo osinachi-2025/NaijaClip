@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -12,19 +14,48 @@ from sqlalchemy.orm import Session
 import models
 import database
 from database import get_db, initialize_database
-from core.config import FRONTEND_URL, GOOGLE_CLIENT_ID, GOOGLE_REDIRECT_URI, MAX_UPLOAD_BYTES, PAYSTACK_PUBLIC_KEY, STORAGE_BACKEND
+from core.config import FRONTEND_URL, GOOGLE_CLIENT_ID, GOOGLE_REDIRECT_URI, JOB_RECOVERY_INTERVAL_SECONDS, MAX_UPLOAD_BYTES, PAYSTACK_PUBLIC_KEY, STORAGE_BACKEND
 from integrations.storage import LocalStorage, R2Storage
 from routers.auth import get_current_active_user
 from services.media_validation import VideoValidationError, validate_video_file
-from services.jobs import cancel_job
+from services.jobs import cancel_job, dispatch_processing_job, recover_stalled_jobs, recover_unpublished_jobs
 
 app = FastAPI(title="NaijaClip API", version="1.0.0")
 storage = R2Storage() if STORAGE_BACKEND == "r2" else LocalStorage()
+logger = logging.getLogger("naijaclip.recovery")
+
+
+def _recover_jobs() -> None:
+    with database.SessionLocal() as db:
+        recover_stalled_jobs(db)
+        recover_unpublished_jobs(db)
+
+
+async def _run_job_recovery() -> None:
+    while True:
+        await asyncio.sleep(JOB_RECOVERY_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(_recover_jobs)
+        except Exception:
+            logger.exception("periodic job recovery failed")
 
 
 @app.on_event("startup")
 def create_schema() -> None:
     initialize_database()
+    _recover_jobs()
+    app.state.job_recovery_task = asyncio.create_task(_run_job_recovery())
+
+
+@app.on_event("shutdown")
+async def stop_job_recovery() -> None:
+    task = getattr(app.state, "job_recovery_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 def frontend_config() -> dict:
@@ -104,6 +135,7 @@ def create_video_job(
         )
         db.add(job)
         db.commit()
+        dispatch_processing_job(db, job.id)
         return {"job_id": job.id, "video_id": video.id, "status": job.status.value}
     except VideoValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

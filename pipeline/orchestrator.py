@@ -3,10 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from models import JobStatus, VideoStatus
-from services.jobs import ensure_job_active, update_job
+from models import JobStatus, ProcessingJob, VideoStatus
+from services.jobs import JobClaimLost, ensure_job_active, update_job
 from core.config import STORAGE_BACKEND
 from integrations.ffmpeg import FFmpeg
 from integrations.storage import LocalStorage, R2Storage
@@ -15,9 +16,15 @@ from .stages import PipelineStages
 
 
 class PipelineOrchestrator:
-    def __init__(self, db: Session, stage_handlers: dict[str, Callable[[PipelineContext], None]] | None = None):
+    def __init__(
+        self,
+        db: Session,
+        stage_handlers: dict[str, Callable[[PipelineContext], None]] | None = None,
+        worker_id: str | None = None,
+    ):
         self.db = db
         self.stage_handlers = stage_handlers or {}
+        self.worker_id = worker_id
         self.storage = R2Storage() if STORAGE_BACKEND == "r2" else LocalStorage()
         self.ffmpeg = FFmpeg()
 
@@ -83,8 +90,8 @@ class PipelineOrchestrator:
             ("cleanup", JobStatus.EXPORTING, 99),
         ]
         for stage, status, progress in stages:
-            ensure_job_active(self.db, job_id)
-            update_job(self.db, job_id, status=status, stage=stage, progress=progress)
+            ensure_job_active(self.db, job_id, worker_id=self.worker_id)
+            update_job(self.db, job_id, status=status, stage=stage, progress=progress, worker_id=self.worker_id)
             handler = self.stage_handlers.get(stage)
             if handler:
                 handler(context)
@@ -94,12 +101,40 @@ class PipelineOrchestrator:
                 self._analyze_media(context)
             else:
                 raise RuntimeError(f"pipeline stage is not configured: {stage}")
-            ensure_job_active(self.db, job_id)
+            ensure_job_active(self.db, job_id, worker_id=self.worker_id)
         job = self.db.get(ProcessingJob, job_id)
-        job.status = JobStatus.COMPLETED
-        job.current_stage = "completed"
-        job.progress = 100
-        job.completed_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        completed_at = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        if self.worker_id is not None:
+            completed = self.db.execute(
+                update(ProcessingJob)
+                .where(
+                    ProcessingJob.id == job_id,
+                    ProcessingJob.worker_id == self.worker_id,
+                    ProcessingJob.status.notin_({
+                        JobStatus.COMPLETED,
+                        JobStatus.FAILED,
+                        JobStatus.CANCELLED,
+                        JobStatus.CANCELED,
+                    }),
+                    ProcessingJob.cancelled_at.is_(None),
+                )
+                .execution_options(synchronize_session=False)
+                .values(
+                    status=JobStatus.COMPLETED,
+                    current_stage="completed",
+                    progress=100,
+                    completed_at=completed_at,
+                    last_heartbeat_at=completed_at,
+                )
+            )
+            if completed.rowcount != 1:
+                self.db.rollback()
+                raise JobClaimLost(f"processing job {job_id} is no longer owned by {self.worker_id}")
+        else:
+            job.status = JobStatus.COMPLETED
+            job.current_stage = "completed"
+            job.progress = 100
+            job.completed_at = completed_at
         job.video.status = VideoStatus.COMPLETED
         self.db.commit()
         return context

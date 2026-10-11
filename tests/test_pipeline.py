@@ -364,7 +364,7 @@ def test_orchestrator_runs_detection_tracking_and_reframing_before_render(monkey
     events = []
     job = SimpleNamespace(id="job-1", video=SimpleNamespace())
     db = SimpleNamespace(get=lambda *_args: job, commit=lambda: None)
-    monkeypatch.setattr(orchestrator_module, "ensure_job_active", lambda *_args: None)
+    monkeypatch.setattr(orchestrator_module, "ensure_job_active", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(orchestrator_module, "update_job", lambda _db, _job_id, *, stage, **_kwargs: events.append(stage))
     handler_names = {
         "ingestion", "input_validation", "media_analysis", "audio_extraction",

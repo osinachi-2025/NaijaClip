@@ -20,6 +20,8 @@ logger = logging.getLogger("naijaclip.worker")
 
 class Worker:
     def __init__(self, poll_seconds: float = WORKER_POLL_SECONDS):
+        if os.getenv("NAIJACLIP_ENABLE_LEGACY_WORKER") != "1":
+            raise RuntimeError("Legacy polling worker is disabled; set NAIJACLIP_ENABLE_LEGACY_WORKER=1 to opt in.")
         self.poll_seconds = poll_seconds
         self.running = True
         initialize_database()
@@ -60,5 +62,14 @@ class Worker:
                 time.sleep(self.poll_seconds)
 
 
-if __name__ == "__main__":
+def run_legacy_worker() -> None:
+    if os.getenv("NAIJACLIP_ENABLE_LEGACY_WORKER") != "1":
+        raise SystemExit(
+            "Legacy polling worker is disabled. Set NAIJACLIP_ENABLE_LEGACY_WORKER=1 to opt in; "
+            "production should use celery -A workers.celery_app worker --loglevel=info."
+        )
     Worker().run_forever()
+
+
+if __name__ == "__main__":
+    run_legacy_worker()

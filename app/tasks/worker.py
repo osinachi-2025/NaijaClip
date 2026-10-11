@@ -1,5 +1,5 @@
-from tasks.worker import Worker
+from tasks.worker import run_legacy_worker
 
 
 if __name__ == "__main__":
-    Worker().run_forever()
+    run_legacy_worker()

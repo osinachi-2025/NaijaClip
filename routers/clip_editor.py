@@ -11,6 +11,7 @@ import models
 from database import get_db
 from routers.auth import get_current_active_user
 from services.clip_editor import normalize_edit_configuration
+from services.jobs import dispatch_processing_job
 from services.subtitles import build_subtitle_chunks
 
 
@@ -220,6 +221,7 @@ def create_clip_export(
     db.flush()
     clip_export.processing_job_id = job.id
     db.commit()
+    dispatch_processing_job(db, job.id)
     return {"export_id": clip_export.id, "job_id": job.id, "status": clip_export.status.value}
 
 

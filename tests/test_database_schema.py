@@ -47,6 +47,11 @@ def test_initialize_database_adds_missing_job_columns(tmp_path, monkeypatch):
         assert "retryable" in columns
         assert "last_heartbeat_at" in columns
         assert "cancelled_at" in columns
+        assert "dispatch_token" in columns
+        assert "dispatch_lease_until" in columns
+        assert "dispatch_retry_at" in columns
+        assert "dispatch_attempts" in columns
+        assert "dispatch_published_at" in columns
 
         video_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(videos)").fetchall()}
         assert "audio_quality_status" in video_columns
