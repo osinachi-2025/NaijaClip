@@ -100,12 +100,14 @@ R2_BUCKET_NAME=<bucket name>
 R2_ENDPOINT_URL=<R2 S3-compatible endpoint>
 R2_ACCESS_KEY_ID=<R2 access key>
 R2_SECRET_ACCESS_KEY=<R2 secret key>
-R2_PUBLIC_URL=<public base URL when generated media needs public URLs>
+R2_PUBLIC_URL=<optional legacy media base; leave unset for private clip storage>
 DEEPGRAM_API_KEY=<Deepgram API key for video-analysis jobs>
 GROQ_API_KEY=<Groq API key for video-analysis jobs>
 ```
 
 `R2_ENDPOINT_URL` may instead be derived from `R2_ACCOUNT_ID`. If `STORAGE_BACKEND=local`, API and worker must share the same `MEDIA_ROOT` filesystem. Video-analysis jobs require Deepgram and Groq credentials; clip-render jobs use storage and FFmpeg/FFprobe. `WORKER_CONCURRENCY` is optional when the command sets `--concurrency`, and `CELERY_RESULT_BACKEND` is optional because job state and the Celery task ID are stored in the database. Worker tasks do not require JWT, Google, or Paystack credentials. Store actual production values in a secrets file outside version control.
+
+Dashboard clips, thumbnails, editor sources, and edited exports are streamed through owner-authorized API routes. Keep the R2 bucket private and disable public `r2.dev` or custom-domain access; featured homepage clips are streamed separately only after an administrator features them. `R2_PUBLIC_URL` is not required for dashboard playback.
 
 ## Worker startup and production EC2 guidance
 

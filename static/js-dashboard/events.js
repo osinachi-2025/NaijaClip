@@ -285,6 +285,19 @@ document.addEventListener("change", (e) => {
   }
 });
 
+document.addEventListener("error", (e) => {
+  const video = e.target;
+  if (!(video instanceof HTMLVideoElement) || (!video.matches("[data-clip-id]") && video.id !== "nc-clip-modal-video")) return;
+  const frame = video.closest(".nc-clip-video-frame, .nc-clip-preview, .nc-clip-modal-stage");
+  if (!frame || frame.querySelector("[data-playback-error]")) return;
+  const message = document.createElement("div");
+  message.dataset.playbackError = "1";
+  message.className = "nc-playback-error";
+  message.setAttribute("role", "status");
+  message.textContent = "This clip is temporarily unavailable.";
+  frame.append(message);
+}, true);
+
 document.addEventListener("focusin", (e) => {
   const field = e.target.closest("[data-subtitle-text]");
   if (field && state.clipEditor?.configuration) {

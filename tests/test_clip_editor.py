@@ -157,14 +157,7 @@ def test_clip_editor_and_export_status_are_owner_scoped(tmp_path):
         assert error.value.status_code == 404
 
 
-def test_editor_prefers_clean_editor_source_url(tmp_path, monkeypatch):
-    from app import main
-
-    class FakeStorage:
-        def url_for(self, key):
-            return f"https://media.example/{key}"
-
-    monkeypatch.setattr(main, "storage", FakeStorage())
+def test_editor_uses_owner_protected_media_urls_for_source_and_output(tmp_path):
     engine = _editor_database(tmp_path)
     with Session(engine, expire_on_commit=False) as db:
         owner, _, _, clip = _ready_clip(db)
@@ -173,9 +166,62 @@ def test_editor_prefers_clean_editor_source_url(tmp_path, monkeypatch):
 
         loaded = load_clip_edit(clip.id, current_user=owner, db=db)
 
-    assert loaded["clip"]["source_url"] == "https://media.example/exports/editor-video/editor-source/editor-clip.mp4"
-    assert loaded["clip"]["output_url"] == "https://media.example/clip.mp4"
+    assert loaded["clip"]["source_url"] == "/api/clips/editor-clip/source"
+    assert loaded["clip"]["output_url"] == "/api/clips/editor-clip/video"
     assert loaded["clip"]["has_clean_editor_source"] is True
+
+
+def test_editor_export_completes_with_verified_object_and_protected_url(tmp_path, monkeypatch):
+    import services.clip_editor as editor_service
+
+    class LocalStorageWithoutPlaybackUrl:
+        def path_for(self, key):
+            return tmp_path / key
+
+        def exists(self, key):
+            return (tmp_path / key).is_file()
+
+
+    monkeypatch.setattr(editor_service, "STORAGE_BACKEND", "local")
+    monkeypatch.setattr(editor_service, "LocalStorage", LocalStorageWithoutPlaybackUrl)
+    monkeypatch.setattr(
+        editor_service,
+        "render_clip_edit",
+        lambda _source, output, configuration, _duration: (output.write_bytes(b"edited") and configuration),
+    )
+    engine = _editor_database(tmp_path)
+    source_key = "exports/editor-video/source.mp4"
+    source = tmp_path / source_key
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"source")
+
+    with Session(engine, expire_on_commit=False) as db:
+        owner, _, video, clip = _ready_clip(db)
+        clip.editor_source_storage_key = source_key
+        configuration = {"segments": [{"start": 0, "end": 20}], "subtitles": []}
+        job = models.ProcessingJob(
+            video_id=video.id,
+            job_type=models.JobType.CLIP_RENDER,
+            status=models.JobStatus.QUEUED,
+            current_stage="queued",
+        )
+        db.add(job)
+        db.flush()
+        export = models.ClipExport(
+            clip_id=clip.id,
+            processing_job_id=job.id,
+            edit_configuration=configuration,
+        )
+        db.add(export)
+        db.commit()
+
+        editor_service.process_clip_export(db, job.id)
+
+        db.refresh(job)
+        db.refresh(export)
+        assert job.status == models.JobStatus.COMPLETED
+        assert export.status == models.ExportStatus.COMPLETED
+        assert export.output_url == f"/api/clip-exports/{export.id}/video"
 
 
 def test_legacy_clip_reports_baked_subtitle_limitation(tmp_path):

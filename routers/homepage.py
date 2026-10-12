@@ -17,6 +17,7 @@ from app.main import storage
 from core.config import MAX_FEATURED_HOMEPAGE_CLIPS, R2_PUBLIC_URL
 from database import get_db
 from routers.auth import require_admin
+from services.media_stream import stream_storage_object
 
 
 router = APIRouter(tags=["homepage"])
@@ -121,45 +122,9 @@ def _public_featured_clip(clip_id: str, db: Session) -> models.Clip:
 
 
 def _stream_object(key: str, media_type: str, request: Request) -> StreamingResponse:
-    range_header = request.headers.get("range")
-    params = {"Bucket": storage.bucket, "Key": key}
-    if range_header:
-        if not range_header.startswith("bytes=") or "," in range_header:
-            raise HTTPException(status_code=416, detail="Invalid byte range")
-        params["Range"] = range_header
-    try:
-        item = storage.client.get_object(**params)
-    except ClientError as error:
-        error_code = str(error.response.get("Error", {}).get("Code", ""))
-        if error_code in {"416", "InvalidRange"}:
-            raise HTTPException(status_code=416, detail="Requested byte range is unavailable") from error
-        logger.warning("Featured object stream failed error_type=%s", type(error).__name__)
-        raise HTTPException(status_code=404, detail="Featured media is unavailable") from error
-    except Exception as error:
-        logger.warning("Featured object stream failed error_type=%s", type(error).__name__)
-        raise HTTPException(status_code=503, detail="Featured media is temporarily unavailable") from error
-
-    body = item["Body"]
-
-    def chunks():
-        try:
-            if hasattr(body, "iter_chunks"):
-                yield from body.iter_chunks(chunk_size=1024 * 1024)
-            else:
-                while chunk := body.read(1024 * 1024):
-                    yield chunk
-        finally:
-            body.close()
-
-    headers = {
-        "Accept-Ranges": item.get("AcceptRanges", "bytes"),
-        "Cache-Control": "public, max-age=60",
-    }
-    if item.get("ContentLength") is not None:
-        headers["Content-Length"] = str(item["ContentLength"])
-    if item.get("ContentRange"):
-        headers["Content-Range"] = item["ContentRange"]
-    return StreamingResponse(chunks(), status_code=206 if item.get("ContentRange") else 200, media_type=media_type, headers=headers)
+    response = stream_storage_object(storage, key, media_type, request)
+    response.headers["Cache-Control"] = "public, max-age=60"
+    return response
 
 
 @router.get("/api/homepage/featured-clips")

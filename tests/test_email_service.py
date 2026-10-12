@@ -35,7 +35,7 @@ def test_resend_request_uses_configured_credentials_and_branded_content(monkeypa
     assert "sample-token" in payload["text"]
 
 
-def test_resend_failure_returns_status_and_redacts_api_key(monkeypatch, caplog):
+def test_resend_failure_returns_safe_status_without_logging_provider_payload(monkeypatch, caplog):
     secret = "test-resend-secret"
     monkeypatch.setattr(email_service, "RESEND_API_KEY", secret)
     monkeypatch.setattr(email_service, "MAIL_FROM_EMAIL", "sender@example.com")
@@ -55,8 +55,9 @@ def test_resend_failure_returns_status_and_redacts_api_key(monkeypatch, caplog):
 
     assert result.success is False
     assert result.status_code == 401
-    assert result.error == "Invalid API key [redacted]"
+    assert result.error == "Email provider rejected the request"
     assert secret not in caplog.text
+    assert "person@example.com" not in caplog.text
 
 
 def test_resend_client_error_returns_failure(monkeypatch, caplog):
@@ -72,7 +73,7 @@ def test_resend_client_error_returns_failure(monkeypatch, caplog):
 
     assert result.success is False
     assert result.status_code is None
-    assert result.error == "Resend request failed: ValueError"
+    assert result.error == "Email request failed"
     assert "invalid request" not in caplog.text
 
 
@@ -130,3 +131,33 @@ def test_missing_resend_configuration_returns_failure_without_request(monkeypatc
     assert result.success is False
     assert result.status_code is None
     assert "not configured" in result.error
+
+
+def test_invalid_sender_is_rejected_before_resend_request(monkeypatch):
+    monkeypatch.setattr(email_service, "RESEND_API_KEY", "test-api-key")
+    monkeypatch.setattr(email_service, "MAIL_FROM_EMAIL", "not-an-email")
+    monkeypatch.setattr(
+        email_service.resend.Emails,
+        "send",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not send")),
+    )
+
+    result = email_service.send_email("person@example.com", "Test", "html", "text", email_type="test")
+
+    assert result.success is False
+    assert result.error == "Email sender configuration is invalid"
+
+
+def test_network_timeout_is_reported_without_exception_details(monkeypatch):
+    monkeypatch.setattr(email_service, "RESEND_API_KEY", "test-api-key")
+    monkeypatch.setattr(email_service, "MAIL_FROM_EMAIL", "sender@example.com")
+    monkeypatch.setattr(
+        email_service.resend.Emails,
+        "send",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("private details")),
+    )
+
+    result = email_service.send_email("person@example.com", "Test", "html", "text", email_type="test")
+
+    assert result.success is False
+    assert result.error == "Email request failed"

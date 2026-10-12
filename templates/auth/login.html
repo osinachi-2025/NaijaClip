@@ -289,6 +289,12 @@
           </div>
         </form>
 
+        <div id="resend-verification-row" class="nc-verification-resend">
+          <p>Didn't receive the verification message?</p>
+          <button id="resend-verification" class="nc-link-btn" type="button">Resend verification email</button>
+          <span id="verification-resend-status" role="status" aria-live="polite"></span>
+        </div>
+
         <div class="nc-auth-footer">
           Don’t have an account? <a href="/register">Create one</a>
         </div>
@@ -304,6 +310,41 @@
       const notice = new URLSearchParams(window.location.search).get('notice');
       if (notice === 'verification') showToast('Your account was created. Check your email to verify it.', 'success');
       if (notice === 'verification-retry') showToast('Your account was created, but the verification email could not be sent. Contact support for help.', 'error');
+      const resendButton = document.getElementById('resend-verification');
+      const resendStatus = document.getElementById('verification-resend-status');
+      const verificationCooldownKey = 'naijaclip-verification-resend-at';
+      const updateVerificationCooldown = () => {
+        const remaining = Math.max(0, Math.ceil((Number(localStorage.getItem(verificationCooldownKey) || 0) - Date.now()) / 1000));
+        resendButton.disabled = remaining > 0;
+        resendButton.textContent = remaining ? `Resend verification email in ${remaining}s` : 'Resend verification email';
+      };
+      updateVerificationCooldown();
+      window.setInterval(updateVerificationCooldown, 1000);
+      resendButton.addEventListener('click', async () => {
+        const email = document.getElementById('email').value.trim();
+        if (!email) {
+          resendStatus.textContent = 'Enter your email address above first.';
+          return;
+        }
+        resendButton.disabled = true;
+        resendButton.textContent = 'Requesting...';
+        resendStatus.textContent = '';
+        try {
+          const response = await fetch('/auth/resend-verification', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email }),
+          });
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'Enter a valid email address.');
+          localStorage.setItem(verificationCooldownKey, String(Date.now() + (data.resend_after_seconds || 60) * 1000));
+          resendStatus.textContent = data.detail;
+        } catch (error) {
+          resendStatus.textContent = error.message || 'Unable to reach the server. Try again later.';
+        } finally {
+          updateVerificationCooldown();
+        }
+      });
       if (notice === 'verified') {
         showToast(new URLSearchParams(window.location.search).get('welcome') === 'sent'
           ? 'Email verified. Your welcome email is on its way; you can now sign in.'

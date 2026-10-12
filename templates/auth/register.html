@@ -268,7 +268,13 @@
 
           <div class="nc-field">
             <label for="password">Password</label>
-            <input id="password" type="password" placeholder="Choose a strong password" required />
+            <input id="password" type="password" autocomplete="new-password" minlength="8" placeholder="Choose a strong password" aria-describedby="password-strength-label" required />
+            <div class="nc-password-strength" aria-live="polite">
+              <span id="password-strength-label">Password strength: enter a password</span>
+              <div class="nc-password-strength-track" role="progressbar" aria-label="Estimated password strength" aria-valuemin="0" aria-valuemax="4" aria-valuenow="0" aria-valuetext="No password entered">
+                <span></span>
+              </div>
+            </div>
           </div>
 
           <div class="nc-field">
@@ -288,6 +294,7 @@
     </main>
 
     <script src="/static/js/auth.js"></script>
+    <script src="/static/js/password-strength.js"></script>
     <script>
       const googleBtn = document.querySelector('.nc-google-btn');
       const form = document.getElementById('nc-register-form');

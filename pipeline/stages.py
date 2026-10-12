@@ -23,6 +23,7 @@ from core.config import (
     CAMERA_RETURN_SPEED,
     CAMERA_SMOOTHING_ALPHA,
     MIN_TRACKING_COVERAGE,
+    MAX_CLIPS_PER_VIDEO,
     TRACK_LOST_HOLD_FRAMES,
 )
 from integrations.deepgram import DeepgramClient
@@ -388,6 +389,12 @@ class PipelineStages:
             words = alternative["words"]
             context.transcript_segments = [{"start": float(word.get("start", 0)), "end": float(word.get("end", 0)), "text": word.get("punctuated_word", word.get("word", "")), "confidence": word.get("confidence")} for word in words]
         context._deepgram_raw = raw
+        transcript_duration = max((segment["end"] for segment in context.transcript_segments), default=0.0)
+        source_duration = float(context.media_info.get("format", {}).get("duration") or 0.0)
+        logger.info(
+            "[TRANSCRIPT] source_duration=%.2fs transcript_duration=%.2fs usable_segments=%d transcript_chars=%d",
+            source_duration, transcript_duration, len(context.transcript_segments), len(context.transcript),
+        )
 
     def transcript_validation(self, context: PipelineContext) -> None:
         if not context.transcript or not context.transcript_segments:
@@ -410,10 +417,17 @@ class PipelineStages:
         maximum_duration = min(default_maximum, configured_maximum)
         if duration <= 0:
             raise ValueError("source video duration is invalid")
-        result = GroqClient().evaluate_transcript(context.transcript, context.transcript_segments, duration)
         boundary_segments = _deepgram_word_segments(context) or context.transcript_segments
-        context.groq_candidates = validate_candidates(result.candidates, duration, minimum_duration, maximum_duration, boundary_segments)
-        context.groq_candidates = remove_overlaps(context.groq_candidates)
+        result = GroqClient().evaluate_transcript(context.transcript, boundary_segments, duration)
+        proposed_count = len(result.candidates)
+        validated = validate_candidates(result.candidates, duration, minimum_duration, maximum_duration, boundary_segments)
+        context.groq_candidates = remove_overlaps(validated)
+        logger.info(
+            "[CLIP SELECTION] source_duration=%.2fs transcript_segments=%d proposed=%d rejected_validation=%d rejected_duplicate_overlap=%d survivors=%d",
+            duration, len(boundary_segments), proposed_count,
+            proposed_count - len(validated), len(validated) - len(context.groq_candidates),
+            len(context.groq_candidates),
+        )
         if not context.groq_candidates:
             raise ValueError(f"Groq returned no valid clip candidates for a {duration:.2f}s source; target range was {minimum_duration:.2f}s to {maximum_duration:.2f}s")
 
@@ -428,7 +442,7 @@ class PipelineStages:
         ranked = sorted(scored, key=lambda item: item.final_score, reverse=True)
         threshold = float(os.getenv("MIN_CLIP_SCORE", "5"))
         context.scored_candidates = [item for item in ranked if item.final_score >= threshold]
-        limit = int(os.getenv("MAX_CLIPS_PER_VIDEO", "5"))
+        limit = min(12, MAX_CLIPS_PER_VIDEO)
         context.selected_clips = context.scored_candidates[:limit]
         if not context.selected_clips:
             raise ValueError("no candidates met the minimum score")
@@ -439,6 +453,7 @@ class PipelineStages:
             item.clip = clip
             logger.info("[PIPELINE] LLM selected clip-%d: %s", rank, clip.title)
         self.db.flush()
+        logger.info("[CLIP SELECTION] selected_for_render=%d", len(context.selected_clips))
 
     def clip_extraction(self, context: PipelineContext) -> None:
         for index, item in enumerate(context.selected_clips, 1):
@@ -861,9 +876,11 @@ class PipelineStages:
                     destination = self.storage.path_for(key)
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfileobj(output, destination.open("wb"))
-            item.clip.status = ClipStatus.READY
+            if not self.storage.exists(key):
+                raise FileNotFoundError("generated clip output was not persisted to storage")
+            output_url = f"/api/clips/{item.clip.id}/video"
             item.clip.output_storage_key = key
-            item.clip.output_url = self.storage.url_for(key) if hasattr(self.storage, "url_for") else None
+            item.clip.output_url = output_url
             item.clip.output_mime_type = "video/mp4"
             item.clip.output_size_bytes = item.rendered_path.stat().st_size
             thumbnail_key = f"exports/{context.video.user_id}/{context.video.id}/thumbnail-{index}.jpg"
@@ -875,13 +892,17 @@ class PipelineStages:
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     with destination.open("wb") as destination_file:
                         shutil.copyfileobj(thumbnail, destination_file)
-            item.clip.thumbnail_url = self.storage.url_for(thumbnail_key) if hasattr(self.storage, "url_for") else None
+            if not self.storage.exists(thumbnail_key):
+                raise FileNotFoundError("generated clip thumbnail was not persisted to storage")
             item.clip.thumbnail_storage_key = thumbnail_key
+            item.clip.thumbnail_url = f"/api/clips/{item.clip.id}/thumbnail" if self.storage.exists(thumbnail_key) else None
+            item.clip.status = ClipStatus.READY
             item.clip.completed_at = datetime.now(timezone.utc)
             export = ClipExport(clip_id=item.clip.id, status=ExportStatus.COMPLETED, output_storage_key=key, output_url=item.clip.output_url, file_size_bytes=item.clip.output_size_bytes, completed_at=datetime.now(timezone.utc))
             self.db.add(export)
             context.final_exports.append({"key": key, "url": item.clip.output_url})
         self.db.commit()
+        logger.info("[CLIP EXPORT] rendered=%d persisted=%d", len(context.rendered_outputs), len(context.final_exports))
 
     def cleanup(self, context: PipelineContext) -> None:
         if context.temp_dir and context.temp_dir.exists():

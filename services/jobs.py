@@ -43,6 +43,12 @@ TRANSIENT_FAILURE_PATTERNS = (
 PERMANENT_FAILURE_PATTERNS = (
     "unsupported format",
     "unsupported video",
+    "no such file or directory",
+    "no such filter",
+    "error initializing filter",
+    "error configuring filtergraph",
+    "unknown encoder",
+    "invalid argument",
     "corrupt",
     "invalid request",
     "no usable audio",

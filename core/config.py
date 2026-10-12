@@ -48,7 +48,7 @@ AUDIO_SILENCE_THRESHOLD = _get_float("AUDIO_SILENCE_THRESHOLD", 0.02, minimum=0.
 MIN_AUDIO_LEVEL = _get_float("MIN_AUDIO_LEVEL", 0.03, minimum=0.0)
 TARGET_CLIP_DURATION_SECONDS = _get_float("TARGET_CLIP_DURATION_SECONDS", 60.0, minimum=1.0)
 MAX_CLIP_DURATION_SECONDS = _get_float("MAX_CLIP_DURATION_SECONDS", 180.0, minimum=1.0)
-MAX_CLIPS_PER_VIDEO = _get_int("MAX_CLIPS_PER_VIDEO", 5, minimum=1)
+MAX_CLIPS_PER_VIDEO = _get_int("MAX_CLIPS_PER_VIDEO", 10, minimum=1)
 MAX_FEATURED_HOMEPAGE_CLIPS = _get_int("MAX_FEATURED_HOMEPAGE_CLIPS", 6, minimum=1)
 WORKER_CONCURRENCY = _get_int("WORKER_CONCURRENCY", 2, minimum=1)
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL") or os.getenv("REDIS_URL") or "redis://localhost:6379/0"
@@ -110,7 +110,7 @@ GOOGLE_REDIRECT_URI = os.getenv(
     "https://naijaclip.name.ng/api/auth/google/callback",
 )
 RESEND_API_KEY = (os.getenv("RESEND_API_KEY") or "").strip() or None
-MAIL_FROM_EMAIL = (os.getenv("MAIL_FROM_EMAIL") or "admin@naijaclip.name.ng").strip()
+MAIL_FROM_EMAIL = (os.getenv("MAIL_FROM_EMAIL") or "hello@naijaclip.name.ng").strip()
 MAIL_FROM_NAME = (os.getenv("MAIL_FROM_NAME") or "NaijaClip").strip()
 PAYSTACK_SECRET_KEY = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_PUBLIC_KEY = os.getenv("PAYSTACK_PUBLIC_KEY")
@@ -122,6 +122,7 @@ PRO_MONTHLY_VIDEO_LIMIT = _get_int("PRO_MONTHLY_VIDEO_LIMIT", 50, minimum=1)
 RESET_CODE_EXPIRY_MINUTES = _get_int("RESET_CODE_EXPIRY_MINUTES", 10, minimum=1)
 RESET_CODE_MAX_ATTEMPTS = _get_int("RESET_CODE_MAX_ATTEMPTS", 5, minimum=1)
 RESET_CODE_RESEND_COOLDOWN_SECONDS = _get_int("RESET_CODE_RESEND_COOLDOWN_SECONDS", 45, minimum=1)
+EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS = _get_int("EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS", 60, minimum=1)
 RESET_AUTHORIZATION_EXPIRY_MINUTES = _get_int("RESET_AUTHORIZATION_EXPIRY_MINUTES", 10, minimum=1)
 AUTH_RESET_COOKIE_NAME = "naijaclip_reset_authorization"
 EMAIL_VERIFICATION_EXPIRE_HOURS = _get_int("EMAIL_VERIFICATION_EXPIRE_HOURS", 24, minimum=1)

@@ -25,6 +25,7 @@ from core.config import (
     AUTH_COOKIE_SECURE,
     AUTH_RESET_COOKIE_NAME,
     AUTH_REFRESH_COOKIE_NAME,
+    EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS,
     FRONTEND_URL,
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
@@ -36,6 +37,7 @@ from core.config import (
 from database import get_db
 from services.auth_service import (
     authenticate_user,
+    claim_email_verification_resend,
     create_access_token,
     create_refresh_token,
     create_email_verification_token,
@@ -43,6 +45,7 @@ from services.auth_service import (
     decode_token,
     ensure_initial_admin,
     get_user_by_email,
+    invalidate_previous_email_verification_tokens,
     is_reset_authorization_valid,
     issue_reset_code,
     link_google_account,
@@ -58,7 +61,7 @@ from services.email_service import (
     send_welcome_email,
 )
 from services.paystack_service import approve_subscription, initialize_payment, process_paystack_payment, reject_subscription
-from services.plan_service import monthly_limit_for_plan
+from services.plan_service import monthly_limit_for_plan, monthly_video_usage
 
 router = APIRouter()
 security = HTTPBearer(auto_error=False)
@@ -247,6 +250,8 @@ def register_user_route(payload: RegisterRequest, db: Session = Depends(get_db))
     raw_token = create_email_verification_token(user.id)
     verification_url = build_frontend_url(f"/auth/verify-email?token={raw_token}")
     delivery = send_verification_email(user.email, verification_url)
+    if delivery.success:
+        invalidate_previous_email_verification_tokens(user.id, raw_token)
     return {
         "user": {
             "id": user.id,
@@ -265,19 +270,25 @@ def register_user_route(payload: RegisterRequest, db: Session = Depends(get_db))
 
 
 @router.post("/auth/resend-verification")
-def resend_verification(payload: ForgotPasswordRequest) -> dict[str, Any]:
+def resend_verification(payload: ForgotPasswordRequest, request: Request) -> dict[str, Any]:
+    generic_response = {
+        "detail": "If the account needs verification, a new email can be requested. Check your inbox or retry after the cooldown.",
+        "resend_after_seconds": EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS,
+    }
     user = get_user_by_email(payload.email)
     if user is None or user.email_verified:
-        return {"detail": "If this account needs verification, a new verification email will be sent."}
+        return generic_response
+    requester_ip = request.client.host if request.client else None
+    if not claim_email_verification_resend(user.id, requester_ip):
+        return generic_response
     raw_token = create_email_verification_token(user.id)
     verification_url = build_frontend_url(f"/auth/verify-email?token={raw_token}")
     delivery = send_verification_email(user.email, verification_url)
+    if delivery.success:
+        invalidate_previous_email_verification_tokens(user.id, raw_token)
     if not delivery.success:
-        raise HTTPException(status_code=502, detail="We couldn't send the verification email. Please try again later.")
-    return {
-        "detail": "A new verification email has been sent.",
-        "email_delivery": {"sent": True, "status_code": delivery.status_code, "message_id": delivery.message_id},
-    }
+        logger.warning("verification email delivery failed status=%s", delivery.status_code)
+    return generic_response
 
 
 @router.post("/auth/login")
@@ -539,7 +550,11 @@ def change_password(payload: ChangePasswordRequest, current_user: models.User = 
 
 
 @router.get("/users/me")
-def user_profile(current_user: models.User = Depends(get_current_active_user)) -> dict[str, Any]:
+def user_profile(
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    used_this_month = monthly_video_usage(db, current_user.id)
     return {
         "id": current_user.id,
         "email": current_user.email,
@@ -549,16 +564,17 @@ def user_profile(current_user: models.User = Depends(get_current_active_user)) -
         "plan": current_user.plan.value,
         "subscription_status": current_user.subscription_status,
         "is_verified": current_user.email_verified,
-        "videos_used": current_user.videos_used,
+        "videos_used": used_this_month,
     }
 
 
 @router.get("/billing")
 def billing(current_user: models.User = Depends(get_current_active_user), db: Session = Depends(get_db)) -> dict[str, Any]:
+    used_this_month = monthly_video_usage(db, current_user.id)
     return {
         "current_plan": current_user.plan.value,
         "usage_limit": monthly_limit_for_plan(current_user.plan),
-        "used_this_month": current_user.videos_used,
+        "used_this_month": used_this_month,
         "subscription_status": current_user.subscription_status,
         "subscription_expires_at": current_user.subscription_expires_at.isoformat() if current_user.subscription_expires_at else None,
         "payments": [

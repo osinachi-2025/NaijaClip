@@ -28,6 +28,7 @@ def test_initialize_database_adds_missing_job_columns(tmp_path, monkeypatch):
     database.initialize_database()
 
     with database.engine.begin() as conn:
+        assert "email_verification_resend_throttles" in sa.inspect(conn).get_table_names()
         user_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(users)").fetchall()}
         for column_name in {
             "is_active",

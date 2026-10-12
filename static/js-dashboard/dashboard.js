@@ -124,12 +124,12 @@ function dashboardOverviewHTML() {
               (c) => `
             <div class="nc-clip-list-item nc-clip-list-playable" data-clip-id="${c.id || ""}">
               <div class="nc-clip-preview">
-                ${c.output_url ? `<video controls preload="metadata" playsinline muted data-clip-id="${c.id || ""}" data-clip-url="${c.output_url}" data-clip-title="${(c.title || "Clip").replace(/"/g, "&quot;")}" data-clip-poster="${(c.thumbnail_url || "").replace(/"/g, "&quot;")}" src="${c.output_url}" poster="${c.thumbnail_url || ""}"></video>` : `<div class="nc-clip-list-thumb">${ICONS.play(11)}</div>`}
+                ${c.output_url ? `<video controls preload="metadata" playsinline muted data-clip-id="${c.id || ""}" data-clip-url="${c.output_url}" data-clip-title="${(c.title || "Clip").replace(/"/g, "&quot;")}" data-clip-poster="${(c.thumbnail_url || "").replace(/"/g, "&quot;")}" src="${c.output_url}" poster="${c.thumbnail_url || ""}"></video>` : `<div class="nc-clip-list-thumb" role="status">${c.status === "ready" ? "Playback unavailable" : ICONS.play(11)}</div>`}
               </div>
               <div class="nc-clip-meta">
                 <div class="nc-clip-list-title">${c.title}</div>
-                <div class="nc-clip-list-dur">${formatClipDuration(c.duration_seconds)} · ${c.status}</div>
-                ${c.id ? `<button class="nc-link nc-link-sm nc-focus" type="button" data-edit-clip="${c.id}">Edit clip</button>` : ""}
+                <div class="nc-clip-list-dur">${formatClipDuration(c.duration_seconds)} · ${c.playback_available === false ? "unavailable" : c.status}</div>
+                ${c.id && c.output_url ? `<button class="nc-link nc-link-sm nc-focus" type="button" data-edit-clip="${c.id}">Edit clip</button>` : ""}
               </div>
               ${c.output_url ? `<button class="nc-clip-fullscreen-btn nc-focus" type="button" data-clip-modal-open="${c.id || ""}" data-clip-url="${c.output_url}" data-clip-title="${(c.title || "Clip").replace(/"/g, "&quot;")}" data-clip-poster="${(c.thumbnail_url || "").replace(/"/g, "&quot;")}">${ICONS.maximize}Full</button>` : ""}
             </div>`
@@ -292,12 +292,12 @@ function clipsPageHTML() {
         ${clips.map((clip) => `
           <article class="nc-clip-video-card" data-clip-id="${clip.id || ""}">
             <div class="nc-clip-video-frame">
-              ${clip.output_url ? `<video controls preload="metadata" playsinline muted data-clip-id="${clip.id || ""}" data-clip-url="${clip.output_url}" data-clip-title="${(clip.title || "Clip").replace(/"/g, "&quot;")}" data-clip-poster="${(clip.thumbnail_url || "").replace(/"/g, "&quot;")}" src="${clip.output_url}" poster="${clip.thumbnail_url || ""}"></video>` : `<div class="nc-clip-list-thumb nc-clip-list-thumb-lg">${ICONS.play(13)}</div>`}
+              ${clip.output_url ? `<video controls preload="metadata" playsinline muted data-clip-id="${clip.id || ""}" data-clip-url="${clip.output_url}" data-clip-title="${(clip.title || "Clip").replace(/"/g, "&quot;")}" data-clip-poster="${(clip.thumbnail_url || "").replace(/"/g, "&quot;")}" src="${clip.output_url}" poster="${clip.thumbnail_url || ""}"></video>` : `<div class="nc-clip-list-thumb nc-clip-list-thumb-lg" role="status">${clip.status === "ready" ? "Playback unavailable" : ICONS.play(13)}</div>`}
               ${clip.output_url ? `<button class="nc-clip-fullscreen-btn nc-focus" type="button" data-clip-modal-open="${clip.id || ""}" data-clip-url="${clip.output_url}" data-clip-title="${(clip.title || "Clip").replace(/"/g, "&quot;")}" data-clip-poster="${(clip.thumbnail_url || "").replace(/"/g, "&quot;")}">${ICONS.maximize}Full</button>` : ""}
             </div>
             <div class="nc-clip-info">
               <div class="nc-clip-list-title">${clip.title}</div>
-              <div class="nc-clip-list-dur">${formatClipDuration(clip.duration_seconds)} · ${clip.status}</div>
+              <div class="nc-clip-list-dur">${formatClipDuration(clip.duration_seconds)} · ${clip.playback_available === false ? "unavailable" : clip.status}</div>
               ${state.user.role === "admin" && clip.is_featured ? `<div class="nc-featured-status">Featured on Homepage</div>` : ""}
             </div>
             <div class="nc-clip-actions">

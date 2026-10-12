@@ -28,6 +28,18 @@ def test_r2_storage_sets_extended_read_timeout(monkeypatch):
     assert captured["config"].connect_timeout >= 30
 
 
+def test_r2_public_url_encodes_key_and_handles_missing_or_invalid_base(monkeypatch):
+    monkeypatch.setattr("core.config.R2_PUBLIC_URL", "https://media.example.test/base/")
+    storage = storage_mod.R2Storage.__new__(storage_mod.R2Storage)
+
+    assert storage.url_for("exports/user id/clip#1.mp4") == "https://media.example.test/base/exports/user%20id/clip%231.mp4"
+
+    monkeypatch.setattr("core.config.R2_PUBLIC_URL", None)
+    assert storage.url_for("exports/clip.mp4") is None
+    monkeypatch.setattr("core.config.R2_PUBLIC_URL", "not-a-url")
+    assert storage.url_for("exports/clip.mp4") is None
+
+
 def test_generated_clip_upload_and_exists_share_client_bucket_and_key(monkeypatch):
     captured = {}
 

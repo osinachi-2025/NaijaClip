@@ -1,3 +1,4 @@
+import json
 import sys
 from types import SimpleNamespace
 
@@ -6,6 +7,7 @@ from core.config import CAMERA_DEAD_ZONE, TRACK_LOST_HOLD_FRAMES
 import pipeline.orchestrator as orchestrator_module
 import pipeline.stages as stages_module
 from pipeline.context import PipelineContext
+from integrations.groq.client import GroqClient
 from pipeline.orchestrator import PipelineOrchestrator
 from pipeline.scoring import score_candidate
 from pipeline.stages import (
@@ -41,6 +43,18 @@ def test_overlapping_candidates_are_deduplicated():
     ]
     valid = remove_overlaps(validate_candidates(candidates, source_duration=40, minimum_duration=1))
     assert len(valid) == 1
+    assert valid[0].candidate.reason == "overlap"
+
+
+def test_candidates_with_distinct_moments_and_limited_overlap_survive():
+    candidates = [
+        ClipCandidate(start=0, end=20, reason="first moment", scores=scores()),
+        ClipCandidate(start=15, end=35, reason="second moment", scores=scores()),
+    ]
+
+    valid = remove_overlaps(validate_candidates(candidates, source_duration=40, minimum_duration=1))
+
+    assert [item.candidate.reason for item in valid] == ["first moment", "second moment"]
 
 
 def test_final_score_uses_python_weights():
@@ -154,6 +168,100 @@ def test_clip_duration_scales_with_video_runtime():
     assert short_min < long_min
     assert short_min >= 6
     assert long_min >= 20
+
+
+def test_candidate_generation_chunks_the_full_long_transcript_and_aggregates():
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            payload = json.loads(kwargs["messages"][1]["content"])
+            calls.append((kwargs["messages"][0]["content"], payload))
+            start = payload["timestamped_segments"][0]["s"]
+            scores = {field: 8 for field in (
+                "hook", "value", "emotional_impact", "clarity", "story_completeness",
+                "quotability", "engagement_potential", "payoff", "context_independence", "clip_efficiency",
+            )}
+            content = json.dumps({"candidates": [{
+                "start": start,
+                "end": start + 30,
+                "reason": f"moment at {start}",
+                "scores": scores,
+            }]})
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+    segments = [
+        {"start": minute * 600, "end": minute * 600 + 10, "text": f"topic {minute}"}
+        for minute in range(4)
+    ]
+
+    result = client.evaluate_transcript("", segments, 2400)
+
+    assert len(calls) == 4
+    assert [call[1]["timestamped_segments"][0]["s"] for call in calls] == [0, 600, 1200, 1800]
+    assert all("no more than 2 self-contained clips" in call[0] for call in calls)
+    assert len(result.candidates) == 4
+
+    calls.clear()
+    client.evaluate_transcript("", [{"start": 0, "end": 2400, "text": "A long complete transcript window."}], 2400)
+    assert len(calls) == 1
+    assert "no more than 8 self-contained clips" in calls[0][0]
+    assert calls[0][0].count("Select no more than") == 1
+
+
+def test_long_video_candidate_target_and_selection_cap_are_bounded():
+    assert GroqClient._candidate_target(2400) == 8
+    assert GroqClient._candidate_target(60) == 3
+    assert GroqClient._candidate_target(60 * 60 * 24) <= 12
+
+
+def test_export_does_not_mark_clip_ready_if_thumbnail_persistence_fails(tmp_path):
+    class FailingThumbnailStorage:
+        def path_for(self, key):
+            if "thumbnail" in key:
+                raise OSError("simulated thumbnail storage failure")
+            return tmp_path / key
+
+        def exists(self, key):
+            return (tmp_path / key).is_file()
+
+        def url_for(self, key):
+            return f"https://media.example.test/{key}"
+
+    class FakeDatabase:
+        def add(self, _item):
+            pass
+
+        def commit(self):
+            raise AssertionError("failed export must not commit")
+
+    source = tmp_path / "editor-source.mp4"
+    rendered = tmp_path / "rendered.mp4"
+    thumbnail = tmp_path / "thumbnail.jpg"
+    source.write_bytes(b"editor source")
+    rendered.write_bytes(b"rendered clip")
+    thumbnail.write_bytes(b"thumbnail")
+    clip = SimpleNamespace(id="clip-1", status=__import__("models").ClipStatus.SELECTED)
+    context = PipelineContext(
+        job=SimpleNamespace(id="job-1"),
+        video=SimpleNamespace(id="video-1", user_id="user-1"),
+        selected_clips=[SimpleNamespace(
+            clip=clip,
+            editor_source_path=source,
+            rendered_path=rendered,
+            thumbnail_path=thumbnail,
+        )],
+        rendered_outputs=[rendered],
+        temp_dir=tmp_path,
+    )
+
+    with pytest.raises(OSError, match="thumbnail storage failure"):
+        PipelineStages(db=FakeDatabase(), storage=FailingThumbnailStorage()).export(context)
+
+    assert clip.status.value == "selected"
 
 
 def test_reframing_uses_center_crop_without_tracking():

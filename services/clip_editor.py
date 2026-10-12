@@ -249,6 +249,10 @@ def process_clip_export(db: Session, job_id: str, *, worker_id: str | None = Non
             with destination.open("wb") as destination_file:
                 shutil.copyfileobj(rendered_file, destination_file)
 
+    if not storage.exists(key):
+        raise FileNotFoundError("edited clip output was not persisted to storage")
+    output_url = f"/api/clip-exports/{clip_export.id}/video"
+
     now = datetime.now(timezone.utc)
     if worker_id is not None:
         completed = db.execute(
@@ -278,7 +282,7 @@ def process_clip_export(db: Session, job_id: str, *, worker_id: str | None = Non
 
     clip_export.status = models.ExportStatus.COMPLETED
     clip_export.output_storage_key = key
-    clip_export.output_url = storage.url_for(key)
+    clip_export.output_url = output_url
     clip_export.file_size_bytes = output.stat().st_size
     clip_export.error_message = None
     clip_export.completed_at = now

@@ -7,7 +7,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -19,6 +20,8 @@ from integrations.storage import LocalStorage, R2Storage
 from routers.auth import get_current_active_user
 from services.media_validation import VideoValidationError, validate_video_file
 from services.jobs import cancel_job, dispatch_processing_job, recover_stalled_jobs, recover_unpublished_jobs
+from services.plan_service import monthly_limit_for_plan, monthly_video_usage
+from services.media_stream import stream_storage_object
 
 app = FastAPI(title="NaijaClip API", version="1.0.0")
 storage = R2Storage() if STORAGE_BACKEND == "r2" else LocalStorage()
@@ -104,6 +107,21 @@ def create_video_job(
             file_size=file.size,
         )
 
+        quota_user = db.scalar(
+            select(models.User)
+            .where(models.User.id == current_user.id)
+            .with_for_update()
+        )
+        if quota_user is None:
+            raise HTTPException(status_code=401, detail="authenticated user is unavailable")
+        used_this_month = monthly_video_usage(db, quota_user.id)
+        usage_limit = monthly_limit_for_plan(quota_user.plan)
+        if used_this_month >= usage_limit:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Monthly video limit reached ({usage_limit}). Upgrade your plan or try again next month.",
+            )
+
         with temp_path.open("rb") as source_handle:
             key = storage.save_upload(source_handle, file.filename, current_user.id, validated.get("mime_type") or file.content_type)
 
@@ -125,6 +143,7 @@ def create_video_job(
             media_metadata=str(validated),
         )
         db.add(video)
+        quota_user.videos_used = used_this_month + 1
         db.flush()
         job = models.ProcessingJob(
             video_id=video.id,
@@ -271,6 +290,55 @@ def list_clips(current_user: models.User = Depends(get_current_active_user), db:
         .where(*clip_filters)
         .order_by(models.Clip.created_at.desc(), models.Clip.rank)
     ).all()
+    repaired_urls = False
+    playback_urls: dict[str, str | None] = {}
+    thumbnail_urls: dict[str, str | None] = {}
+    for clip in clips:
+        playback_url = None
+        if clip.output_storage_key:
+            try:
+                if storage.exists(clip.output_storage_key):
+                    playback_url = f"/api/clips/{clip.id}/video"
+                    if clip.output_url != playback_url:
+                        clip.output_url = playback_url
+                        repaired_urls = True
+                        for export in clip.exports:
+                            if export.output_storage_key == clip.output_storage_key and export.output_url != playback_url:
+                                export.output_url = playback_url
+                elif clip.output_url:
+                    clip.output_url = None
+                    repaired_urls = True
+            except Exception:
+                if clip.output_url:
+                    clip.output_url = None
+                    repaired_urls = True
+                logger.warning("unable to verify playback object for clip_id=%s", clip.id)
+        elif clip.output_url:
+            clip.output_url = None
+            repaired_urls = True
+        playback_urls[clip.id] = playback_url
+        thumbnail_url = None
+        if clip.thumbnail_storage_key:
+            try:
+                if storage.exists(clip.thumbnail_storage_key):
+                    thumbnail_url = f"/api/clips/{clip.id}/thumbnail"
+                    if clip.thumbnail_url != thumbnail_url:
+                        clip.thumbnail_url = thumbnail_url
+                        repaired_urls = True
+                elif clip.thumbnail_url:
+                    clip.thumbnail_url = None
+                    repaired_urls = True
+            except Exception:
+                if clip.thumbnail_url:
+                    clip.thumbnail_url = None
+                    repaired_urls = True
+                logger.warning("unable to verify thumbnail object for clip_id=%s", clip.id)
+        elif clip.thumbnail_url:
+            clip.thumbnail_url = None
+            repaired_urls = True
+        thumbnail_urls[clip.id] = thumbnail_url
+    if repaired_urls:
+        db.commit()
     return {"clips": [{
         "id": clip.id,
         "video_id": clip.video_id,
@@ -281,10 +349,65 @@ def list_clips(current_user: models.User = Depends(get_current_active_user), db:
         "duration_seconds": float(clip.end_seconds - clip.start_seconds),
         "status": clip.status.value,
         "score": float(clip.ai_score) if clip.ai_score is not None else None,
-        "output_url": clip.output_url,
-        "thumbnail_url": clip.thumbnail_url,
-        "can_feature": clip.status == models.ClipStatus.READY and bool(clip.output_storage_key),
+        "output_url": playback_urls.get(clip.id),
+        "thumbnail_url": thumbnail_urls.get(clip.id),
+        "playback_available": playback_urls.get(clip.id) is not None,
+        "can_feature": clip.status == models.ClipStatus.READY and playback_urls.get(clip.id) is not None,
         "is_featured": clip.is_featured,
         "featured_order": clip.featured_order,
         "created_at": clip.created_at.isoformat(),
     } for clip in clips]}
+
+
+def _authorized_clip(clip_id: str, current_user: models.User, db: Session) -> models.Clip:
+    query = select(models.Clip).join(models.Video).where(
+        models.Clip.id == clip_id,
+        models.Clip.deleted_at.is_(None),
+        models.Video.deleted_at.is_(None),
+    )
+    if current_user.role != models.UserRole.ADMIN:
+        query = query.where(models.Video.user_id == current_user.id)
+    clip = db.scalar(query)
+    if clip is None or clip.status != models.ClipStatus.READY or not clip.output_storage_key:
+        raise HTTPException(status_code=404, detail="Clip media not found")
+    return clip
+
+
+@app.get("/api/clips/{clip_id}/video")
+def stream_clip_video(
+    clip_id: str,
+    request: Request,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    clip = _authorized_clip(clip_id, current_user, db)
+    if not storage.exists(clip.output_storage_key):
+        raise HTTPException(status_code=404, detail="Clip media not found")
+    return stream_storage_object(storage, clip.output_storage_key, clip.output_mime_type or "video/mp4", request)
+
+
+@app.get("/api/clips/{clip_id}/thumbnail")
+def stream_clip_thumbnail(
+    clip_id: str,
+    request: Request,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    clip = _authorized_clip(clip_id, current_user, db)
+    if not clip.thumbnail_storage_key or not storage.exists(clip.thumbnail_storage_key):
+        raise HTTPException(status_code=404, detail="Clip thumbnail not found")
+    return stream_storage_object(storage, clip.thumbnail_storage_key, "image/jpeg", request)
+
+
+@app.get("/api/clips/{clip_id}/source")
+def stream_clip_source(
+    clip_id: str,
+    request: Request,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    clip = _authorized_clip(clip_id, current_user, db)
+    key = clip.editor_source_storage_key or clip.output_storage_key
+    if not key or not storage.exists(key):
+        raise HTTPException(status_code=404, detail="Clip source not found")
+    return stream_storage_object(storage, key, "video/mp4", request)

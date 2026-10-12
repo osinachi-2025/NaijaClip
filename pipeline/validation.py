@@ -126,7 +126,7 @@ def clip_duration_range(source_duration: float) -> tuple[float, float]:
         return 16.0, 28.0
     if source_duration <= 300:
         return 18.0, 35.0
-    return 22.0, 45.0
+    return 22.0, 60.0
 
 
 def _sentence_complete(text: str | None) -> bool:
@@ -364,8 +364,12 @@ def validate_candidates(candidates: Iterable[ClipCandidate], source_duration: fl
     minimum_duration = max(default_min, float(minimum_duration))
     maximum_duration = max(float(maximum_duration), minimum_duration)
     valid: list[ValidatedCandidate] = []
+    rejected = {"out_of_bounds": 0, "too_short": 0, "incomplete": 0, "too_long": 0}
+    proposed = 0
     for candidate in candidates:
+        proposed += 1
         if candidate.end > source_duration:
+            rejected["out_of_bounds"] += 1
             continue
 
         original_candidate = candidate
@@ -396,25 +400,55 @@ def validate_candidates(candidates: Iterable[ClipCandidate], source_duration: fl
             )
 
         if duration < minimum_duration and not (transcript_segments and completion.is_complete_thought):
+            rejected["too_short"] += 1
             continue
 
         if transcript_segments and not completion.is_complete_thought:
+            rejected["incomplete"] += 1
             continue
 
         if duration > maximum_duration and not semantic_ok:
+            rejected["too_long"] += 1
             continue
 
         if padded != candidate:
             candidate = padded
 
         valid.append(ValidatedCandidate(candidate, duration, completion))
+    logger.info(
+        "[CLIP VALIDATION] proposed=%d accepted=%d rejected_out_of_bounds=%d rejected_too_short=%d rejected_incomplete=%d rejected_too_long=%d",
+        proposed, len(valid), rejected["out_of_bounds"], rejected["too_short"],
+        rejected["incomplete"], rejected["too_long"],
+    )
     return valid
 
 
 def remove_overlaps(candidates: Iterable[ValidatedCandidate]) -> list[ValidatedCandidate]:
     result: list[ValidatedCandidate] = []
-    for item in candidates:
-        if any(item.candidate.start < other.candidate.end and item.candidate.end > other.candidate.start for other in result):
+    def priority(item: ValidatedCandidate) -> float:
+        scores = item.candidate.scores
+        return (
+            scores.hook * 0.2
+            + scores.story_completeness * 0.2
+            + scores.context_independence * 0.2
+            + scores.clarity * 0.15
+            + scores.engagement_potential * 0.15
+            + scores.payoff * 0.1
+        )
+
+    for item in sorted(candidates, key=priority, reverse=True):
+        overlaps_duplicate = False
+        for other in result:
+            overlap = max(
+                0.0,
+                min(item.candidate.end, other.candidate.end)
+                - max(item.candidate.start, other.candidate.start),
+            )
+            shorter_duration = min(item.duration, other.duration)
+            if shorter_duration > 0 and overlap / shorter_duration >= 0.5:
+                overlaps_duplicate = True
+                break
+        if overlaps_duplicate:
             continue
         result.append(item)
     return result

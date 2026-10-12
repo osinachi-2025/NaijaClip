@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+import re
 from dataclasses import dataclass
 
 import resend
@@ -11,6 +12,7 @@ from core.config import FRONTEND_URL, MAIL_FROM_EMAIL, MAIL_FROM_NAME, RESEND_AP
 
 
 logger = logging.getLogger(__name__)
+_SENDER_EMAIL_PATTERN = re.compile(r"^[^@\s<>]+@[^@\s<>]+\.[^@\s<>]+$")
 
 
 @dataclass(frozen=True)
@@ -40,12 +42,14 @@ def send_email(
             ) if not value
         )
         logger.error(
-            "Resend is not configured type=%s recipient=%s missing=%s",
+            "Resend is not configured type=%s missing=%s",
             email_type,
-            to_email,
             missing,
         )
         return EmailDeliveryResult(False, error="Email delivery is not configured")
+    if not _SENDER_EMAIL_PATTERN.fullmatch(MAIL_FROM_EMAIL):
+        logger.error("Resend sender configuration is invalid type=%s", email_type)
+        return EmailDeliveryResult(False, error="Email sender configuration is invalid")
 
     resend.api_key = RESEND_API_KEY
     sender = f"{MAIL_FROM_NAME} <{MAIL_FROM_EMAIL}>" if MAIL_FROM_NAME else MAIL_FROM_EMAIL
@@ -58,36 +62,29 @@ def send_email(
             "text": text_content,
         })
     except ResendError as error:
-        provider_error = str(error.message or "Resend rejected the email")[:500]
-        if RESEND_API_KEY:
-            provider_error = provider_error.replace(RESEND_API_KEY, "[redacted]")
         try:
             status_code = int(error.code)
         except (TypeError, ValueError):
             status_code = None
         logger.error(
-            "Resend rejected message type=%s recipient=%s status=%s error_type=%s message=%s",
+            "Resend rejected message type=%s status=%s error_type=%s",
             email_type,
-            to_email,
             status_code,
             error.error_type,
-            provider_error,
         )
-        return EmailDeliveryResult(False, status_code, error=provider_error)
+        return EmailDeliveryResult(False, status_code, error="Email provider rejected the request")
     except Exception as error:
         logger.error(
-            "Resend request failed type=%s recipient=%s error_type=%s",
+            "Resend request failed type=%s error_type=%s",
             email_type,
-            to_email,
             type(error).__name__,
         )
-        return EmailDeliveryResult(False, error=f"Resend request failed: {type(error).__name__}")
+        return EmailDeliveryResult(False, error="Email request failed")
 
     message_id = getattr(response, "id", None)
     logger.info(
-        "Email accepted by Resend type=%s recipient=%s message_id=%s",
+        "Email accepted by Resend type=%s message_id=%s",
         email_type,
-        to_email,
         message_id or "unavailable",
     )
     return EmailDeliveryResult(True, 200, str(message_id) if message_id else None)

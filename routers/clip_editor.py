@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -13,6 +14,7 @@ from routers.auth import get_current_active_user
 from services.clip_editor import normalize_edit_configuration
 from services.jobs import dispatch_processing_job
 from services.subtitles import build_subtitle_chunks
+from services.media_stream import stream_storage_object
 
 
 router = APIRouter(tags=["clip-editor"])
@@ -77,20 +79,7 @@ def _default_subtitles(clip: models.Clip, db: Session) -> list[dict[str, Any]]:
 
 def _source_url(clip: models.Clip) -> str | None:
     source_key = clip.editor_source_storage_key or clip.output_storage_key
-    if not clip.editor_source_storage_key and clip.output_url:
-        return clip.output_url
-    from app.main import storage
-
-    public_url = storage.url_for(source_key) if source_key else None
-    if public_url:
-        return public_url
-    if source_key and hasattr(storage, "client"):
-        return storage.client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": storage.bucket, "Key": source_key},
-            ExpiresIn=3600,
-        )
-    return None
+    return f"/api/clips/{clip.id}/source" if source_key else None
 
 
 def _export_payload(clip_export: models.ClipExport, db: Session) -> dict[str, Any]:
@@ -98,7 +87,7 @@ def _export_payload(clip_export: models.ClipExport, db: Session) -> dict[str, An
     return {
         "id": clip_export.id,
         "status": clip_export.status.value,
-        "output_url": clip_export.output_url,
+        "output_url": f"/api/clip-exports/{clip_export.id}/video" if clip_export.output_storage_key else None,
         "error_message": clip_export.error_message,
         "created_at": clip_export.created_at.isoformat(),
         "job": {
@@ -134,9 +123,9 @@ def load_clip_edit(
             "title": clip.title,
             "duration_seconds": duration,
             "source_url": _source_url(clip),
-            "output_url": clip.output_url,
+            "output_url": f"/api/clips/{clip.id}/video" if clip.output_storage_key else None,
             "has_clean_editor_source": bool(clip.editor_source_storage_key),
-            "thumbnail_url": clip.thumbnail_url,
+            "thumbnail_url": f"/api/clips/{clip.id}/thumbnail" if clip.thumbnail_storage_key else None,
         },
         "configuration": normalize_edit_configuration(configuration, duration),
         "exports": [
@@ -244,16 +233,36 @@ def get_clip_export(
     )
     if clip_export is None or clip_export.edit_configuration is None:
         raise HTTPException(status_code=404, detail="clip export not found")
-    job = db.get(models.ProcessingJob, clip_export.processing_job_id) if clip_export.processing_job_id else None
-    return {
-        "id": clip_export.id,
-        "status": clip_export.status.value,
-        "output_url": clip_export.output_url,
-        "error_message": clip_export.error_message,
-        "job": {
-            "id": job.id,
-            "status": job.status.value,
-            "current_stage": job.current_stage,
-            "progress": job.progress,
-        } if job else None,
-    }
+    return _export_payload(clip_export, db)
+
+
+@router.get("/api/clip-exports/{export_id}/video")
+def stream_clip_export(
+    export_id: str,
+    request: Request,
+    current_user: models.User = Depends(get_current_active_user),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    clip_export = db.scalar(
+        select(models.ClipExport)
+        .join(models.Clip)
+        .join(models.Video)
+        .where(
+            models.ClipExport.id == export_id,
+            models.Video.user_id == current_user.id,
+            models.Video.deleted_at.is_(None),
+            models.Clip.deleted_at.is_(None),
+        )
+    )
+    if (
+        clip_export is None
+        or clip_export.edit_configuration is None
+        or clip_export.status != models.ExportStatus.COMPLETED
+        or not clip_export.output_storage_key
+    ):
+        raise HTTPException(status_code=404, detail="Clip export not found")
+    from app.main import storage
+
+    if not storage.exists(clip_export.output_storage_key):
+        raise HTTPException(status_code=404, detail="Clip export not found")
+    return stream_storage_object(storage, clip_export.output_storage_key, "video/mp4", request)

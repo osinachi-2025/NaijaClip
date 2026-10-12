@@ -183,7 +183,18 @@ async def health():
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
-from app.main import cancel_video, create_video_job, delete_video, get_job, health, list_clips, list_videos
+from app.main import (
+    cancel_video,
+    create_video_job,
+    delete_video,
+    get_job,
+    health,
+    list_clips,
+    list_videos,
+    stream_clip_source,
+    stream_clip_thumbnail,
+    stream_clip_video,
+)
 
 app.add_api_route("/health", health, methods=["GET"])
 app.add_api_route("/api/videos", create_video_job, methods=["POST"], status_code=202)
@@ -192,5 +203,8 @@ app.add_api_route("/api/videos/{video_id}", delete_video, methods=["DELETE"], st
 app.add_api_route("/api/jobs/{job_id}", get_job, methods=["GET"])
 app.add_api_route("/api/videos", list_videos, methods=["GET"])
 app.add_api_route("/api/clips", list_clips, methods=["GET"])
+app.add_api_route("/api/clips/{clip_id}/video", stream_clip_video, methods=["GET"])
+app.add_api_route("/api/clips/{clip_id}/thumbnail", stream_clip_thumbnail, methods=["GET"])
+app.add_api_route("/api/clips/{clip_id}/source", stream_clip_source, methods=["GET"])
 
 

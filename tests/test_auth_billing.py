@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from urllib.parse import parse_qs, urlparse
@@ -389,6 +391,145 @@ def test_registration_reports_verification_provider_failure(tmp_path, monkeypatc
     assert response.status_code == 200
     assert response.json()["email_delivery"] == {"sent": False, "status_code": 401, "message_id": None}
     assert "could not be sent" in response.json()["detail"]
+
+
+def test_resend_verification_uses_generic_response_and_server_cooldown(tmp_path, monkeypatch):
+    _reset_db(tmp_path, monkeypatch)
+    database.initialize_database()
+    user = register_user("resend-verify@example.com", "StrongPassword123!")
+    sent = []
+    monkeypatch.setattr(
+        auth_router_module,
+        "send_verification_email",
+        lambda email, url: (sent.append((email, url)) or EmailDeliveryResult(True, 201, "verify-1")),
+    )
+
+    with TestClient(web_app.app) as client:
+        first = client.post("/auth/resend-verification", json={"email": user.email})
+        repeated = client.post("/auth/resend-verification", json={"email": user.email})
+        unknown = client.post("/auth/resend-verification", json={"email": "missing@example.com"})
+
+    assert first.status_code == repeated.status_code == unknown.status_code == 200
+    assert first.json() == repeated.json() == unknown.json()
+    assert first.json()["resend_after_seconds"] >= 1
+    assert len(sent) == 1
+    assert "token=" in sent[0][1]
+
+
+def test_verification_resend_cooldown_allows_only_one_parallel_claim(tmp_path, monkeypatch):
+    _reset_db(tmp_path, monkeypatch)
+    database.initialize_database()
+    user = register_user("parallel-resend@example.com", "StrongPassword123!")
+    from services.auth_service import claim_email_verification_resend
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        claims = list(executor.map(
+            lambda _: claim_email_verification_resend(user.id, "203.0.113.9"),
+            range(8),
+        ))
+
+    assert sum(claims) == 1
+
+
+def test_verification_resend_throttle_is_atomic_for_parallel_requests(tmp_path, monkeypatch):
+    _reset_db(tmp_path, monkeypatch)
+    database.initialize_database()
+    user = register_user("parallel-resend@example.com", "StrongPassword123!")
+    from services.auth_service import claim_email_verification_resend
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        results = list(executor.map(
+            lambda _index: claim_email_verification_resend(user.id, "203.0.113.20"),
+            range(6),
+        ))
+
+    assert results.count(True) == 1
+    assert results.count(False) == 5
+
+
+def test_resend_verification_provider_failure_is_generic_and_rate_limited(tmp_path, monkeypatch):
+    _reset_db(tmp_path, monkeypatch)
+    database.initialize_database()
+    user = register_user("resend-failed@example.com", "StrongPassword123!")
+    monkeypatch.setattr(
+        auth_router_module,
+        "send_verification_email",
+        lambda *_args: EmailDeliveryResult(False, 503, error="private provider detail"),
+    )
+
+    with TestClient(web_app.app) as client:
+        response = client.post("/auth/resend-verification", json={"email": user.email})
+
+    assert response.status_code == 200
+    assert "private provider detail" not in response.text
+
+
+def test_failed_verification_resend_preserves_previous_live_token(tmp_path, monkeypatch):
+    _reset_db(tmp_path, monkeypatch)
+    database.initialize_database()
+    user = register_user("resend-preserve@example.com", "StrongPassword123!")
+    from services.auth_service import create_email_verification_token, verify_email_token
+
+    previous_token = create_email_verification_token(user.id)
+    monkeypatch.setattr(
+        auth_router_module,
+        "send_verification_email",
+        lambda *_args: EmailDeliveryResult(False, 503, error="provider unavailable"),
+    )
+
+    with TestClient(web_app.app) as client:
+        response = client.post("/auth/resend-verification", json={"email": user.email})
+
+    assert response.status_code == 200
+    assert verify_email_token(previous_token) is not None
+
+
+def test_resend_verification_does_not_send_for_verified_account(tmp_path, monkeypatch):
+    _reset_db(tmp_path, monkeypatch)
+    database.initialize_database()
+    user = register_user("verified-resend@example.com", "StrongPassword123!", auth_provider="google")
+    monkeypatch.setattr(
+        auth_router_module,
+        "send_verification_email",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("verified account must not send")),
+    )
+
+    with TestClient(web_app.app) as client:
+        response = client.post("/auth/resend-verification", json={"email": user.email})
+
+    assert response.status_code == 200
+    assert response.json()["resend_after_seconds"] >= 1
+
+
+def test_email_verification_tokens_expire_and_are_single_use(tmp_path, monkeypatch):
+    _reset_db(tmp_path, monkeypatch)
+    database.initialize_database()
+    user = register_user("token-lifecycle@example.com", "StrongPassword123!")
+    from services.auth_service import create_email_verification_token, verify_email_token
+
+    expired_token = create_email_verification_token(user.id)
+    with database.SessionLocal() as db:
+        token_hash = __import__("hashlib").sha256(expired_token.encode()).hexdigest()
+        record = db.query(models.EmailVerificationToken).filter_by(token_hash=token_hash).one()
+        record.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    assert verify_email_token(expired_token) is None
+
+    valid_token = create_email_verification_token(user.id)
+    verified_user = verify_email_token(valid_token)
+    assert verified_user is not None and verified_user.email_verified is True
+    assert verify_email_token(valid_token) is None
+
+
+def test_register_and_login_templates_expose_resend_and_strength_controls():
+    with TestClient(web_app.app) as client:
+        registration = client.get("/register")
+        login = client.get("/login")
+
+    assert 'src="/static/js/password-strength.js"' in registration.text
+    assert 'id="password-strength-label"' in registration.text
+    assert 'id="resend-verification"' in login.text
+    assert "/auth/resend-verification" in login.text
 
 
 def test_password_reset_reports_provider_failure_without_provider_detail(tmp_path, monkeypatch):

@@ -10,6 +10,8 @@ from typing import Any
 import jwt
 from passlib.context import CryptContext
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 import models
 from core.config import (
@@ -19,6 +21,8 @@ from core.config import (
     ADMIN_PASSWORD,
     JWT_ALGORITHM,
     JWT_SECRET_KEY,
+    EMAIL_VERIFICATION_EXPIRE_HOURS,
+    EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS,
     RESET_AUTHORIZATION_EXPIRY_MINUTES,
     RESET_CODE_EXPIRY_MINUTES,
     RESET_CODE_MAX_ATTEMPTS,
@@ -106,15 +110,56 @@ def register_user(email: str, password: str, first_name: str | None = None, last
 
 def create_email_verification_token(user_id: str) -> str:
     raw_token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
     record = models.EmailVerificationToken(
         user_id=user_id,
         token_hash=hashlib.sha256(raw_token.encode()).hexdigest(),
-        expires_at=datetime.now(timezone.utc) + timedelta(hours=24),
+        expires_at=now + timedelta(hours=EMAIL_VERIFICATION_EXPIRE_HOURS),
     )
     with database.SessionLocal() as db:
         db.add(record)
         db.commit()
     return raw_token
+
+
+def invalidate_previous_email_verification_tokens(user_id: str, current_token: str) -> None:
+    now = datetime.now(timezone.utc)
+    current_hash = hashlib.sha256(current_token.encode()).hexdigest()
+    with database.SessionLocal() as db:
+        db.query(models.EmailVerificationToken).filter(
+            models.EmailVerificationToken.user_id == user_id,
+            models.EmailVerificationToken.used_at.is_(None),
+            models.EmailVerificationToken.token_hash != current_hash,
+        ).update({models.EmailVerificationToken.used_at: now}, synchronize_session=False)
+        db.commit()
+
+
+def claim_email_verification_resend(user_id: str, requester_ip: str | None) -> bool:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=EMAIL_VERIFICATION_RESEND_COOLDOWN_SECONDS)
+    scopes = [f"user:{user_id}"]
+    if requester_ip:
+        scopes.append(f"ip:{requester_ip}")
+    scope_hashes = [hashlib.sha256(scope.encode()).hexdigest() for scope in scopes]
+
+    with database.SessionLocal() as db:
+        dialect = db.bind.dialect.name
+        insert = sqlite_insert if dialect == "sqlite" else postgresql_insert if dialect == "postgresql" else None
+        if insert is None:
+            raise RuntimeError("verification resend throttling requires SQLite or PostgreSQL")
+        table = models.EmailVerificationResendThrottle
+        for scope_hash in scope_hashes:
+            statement = insert(table).values(scope_hash=scope_hash, last_requested_at=now)
+            statement = statement.on_conflict_do_update(
+                index_elements=[table.scope_hash],
+                set_={"last_requested_at": now},
+                where=table.last_requested_at <= cutoff,
+            )
+            if db.execute(statement).rowcount != 1:
+                db.rollback()
+                return False
+        db.commit()
+    return True
 
 
 def link_google_account(

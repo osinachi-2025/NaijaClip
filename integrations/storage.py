@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 import boto3
@@ -108,5 +109,10 @@ class R2Storage:
 
     def url_for(self, key: str) -> str | None:
         from core.config import R2_PUBLIC_URL
-        return f"{R2_PUBLIC_URL.rstrip('/')}/{key}" if R2_PUBLIC_URL else None
+        if not R2_PUBLIC_URL or not key or key.startswith("/"):
+            return None
+        public_url = urlsplit(R2_PUBLIC_URL)
+        if public_url.scheme not in {"http", "https"} or not public_url.netloc:
+            return None
+        return f"{R2_PUBLIC_URL.rstrip('/')}/{quote(key, safe='/')}"
 

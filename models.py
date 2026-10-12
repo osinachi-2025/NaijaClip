@@ -1647,6 +1647,13 @@ class EmailVerificationToken(Base):
     )
 
 
+class EmailVerificationResendThrottle(Base):
+    __tablename__ = "email_verification_resend_throttles"
+
+    scope_hash: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 # ============================================================
 # PASSWORD RESET TOKENS
 # ============================================================
