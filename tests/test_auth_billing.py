@@ -246,6 +246,14 @@ def test_google_callback_exchanges_code_links_user_and_sets_session_cookies(tmp_
     monkeypatch.setattr(auth_router_module, "GOOGLE_REDIRECT_URI", callback_uri)
     monkeypatch.setattr(auth_router_module, "AUTH_COOKIE_SECURE", False)
     exchanged = {}
+    welcome_emails = []
+    monkeypatch.setattr(
+        auth_router_module,
+        "send_welcome_email",
+        lambda email, name: (
+            welcome_emails.append((email, name)) or EmailDeliveryResult(True, 200, "welcome-1")
+        ),
+    )
 
     class FakeResponse:
         status_code = 200
@@ -295,6 +303,18 @@ def test_google_callback_exchanges_code_links_user_and_sets_session_cookies(tmp_
         assert client.get("/", follow_redirects=False).status_code == 200
         assert client.post("/auth/logout").status_code == 200
         assert client.get("/users/me").status_code == 401
+
+        start_again = client.get("/auth/google", follow_redirects=False)
+        state_again = client.cookies.get(auth_router_module.GOOGLE_STATE_COOKIE_NAME)
+        callback_again = client.get(
+            "/api/auth/google/callback",
+            params={"code": "authorization-code", "state": state_again},
+            follow_redirects=False,
+        )
+        assert start_again.status_code == 302
+        assert callback_again.status_code == 303
+
+    assert welcome_emails == [("google-person@gmail.com", "Google")]
 
     assert exchanged == {
         "redirect_uri": callback_uri,

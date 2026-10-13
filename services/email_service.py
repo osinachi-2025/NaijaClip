@@ -150,6 +150,43 @@ def send_welcome_email(user_email: str, first_name: str | None = None) -> EmailD
     )
 
 
+def send_video_processing_complete_email(
+    user_email: str,
+    first_name: str | None,
+    last_name: str | None,
+    video_title: str,
+    clip_count: int,
+) -> EmailDeliveryResult:
+    full_name = " ".join(part.strip() for part in (first_name, last_name) if part and part.strip())
+    greeting_name = full_name or "there"
+    safe_title = html.escape(video_title)
+    dashboard_url = build_frontend_url("/dashboard")
+    message_html = (
+        f"<p style=\"margin:0 0 12px;\">Hello {html.escape(greeting_name)}, your video "
+        f"<strong>{safe_title}</strong> has finished processing.</p>"
+        f"<p style=\"margin:0;\">{clip_count} "
+        f"{'clip is' if clip_count == 1 else 'clips are'} ready in your dashboard.</p>"
+    )
+    text_content = (
+        f"Hello {greeting_name}, your video \"{video_title}\" has finished processing. "
+        f"{clip_count} {'clip is' if clip_count == 1 else 'clips are'} ready: {dashboard_url}"
+    )
+    return send_email(
+        user_email,
+        "Your NaijaClip video is ready",
+        _branded_email(
+            title="Your video is ready",
+            explanation="Your NaijaClip video has finished processing.",
+            message_html=message_html,
+            action_label="View your clips",
+            action_url=dashboard_url,
+            supporting_text="Sign in to preview and manage your clips.",
+        ),
+        text_content,
+        email_type="video_processing_complete",
+    )
+
+
 def send_verification_email(user_email: str, verification_url: str) -> EmailDeliveryResult:
     absolute_url = verification_url if verification_url.startswith(("http://", "https://")) else build_frontend_url(verification_url)
     return send_email(

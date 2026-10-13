@@ -48,7 +48,7 @@ from services.auth_service import (
     invalidate_previous_email_verification_tokens,
     is_reset_authorization_valid,
     issue_reset_code,
-    link_google_account,
+    link_google_account_with_status,
     register_user,
     verify_email_token,
     verify_password,
@@ -424,7 +424,7 @@ def google_callback(
         raise HTTPException(status_code=401, detail="Google did not provide a verified email address.")
 
     try:
-        user = link_google_account(
+        user, created = link_google_account_with_status(
             str(google_subject),
             str(email),
             profile.get("given_name"),
@@ -433,6 +433,14 @@ def google_callback(
         )
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    if created:
+        welcome_delivery = send_welcome_email(user.email, user.first_name)
+        if not welcome_delivery.success:
+            logger.warning(
+                "Google welcome email delivery failed status=%s",
+                welcome_delivery.status_code,
+            )
 
     redirect = RedirectResponse(url="/dashboard", status_code=303)
     _set_auth_cookies(redirect, user)

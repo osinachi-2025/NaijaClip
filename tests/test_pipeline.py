@@ -633,6 +633,68 @@ def test_orchestrator_runs_detection_tracking_and_reframing_before_render(monkey
     assert events.index("reframing") < events.index("ffmpeg_rendering")
 
 
+@pytest.mark.parametrize(
+    ("email", "auth_provider"),
+    [
+        ("video-owner@gmail.com", "google"),
+        ("local-owner@example.com", "local"),
+    ],
+)
+def test_orchestrator_emails_completed_video_to_owner_with_name_email_and_clip_count(
+    monkeypatch,
+    email,
+    auth_provider,
+):
+    notifications = []
+    owner = SimpleNamespace(
+        email=email,
+        first_name="Ada",
+        last_name="Okafor",
+        auth_provider=auth_provider,
+    )
+    job = SimpleNamespace(
+        id="job-1",
+        video=SimpleNamespace(
+            id="video-1",
+            user_id="user-1",
+            title="My finished video",
+            status=None,
+        ),
+    )
+    db = SimpleNamespace(
+        get=lambda _model, identifier: job if identifier == job.id else owner,
+        commit=lambda: None,
+    )
+    monkeypatch.setattr(orchestrator_module, "ensure_job_active", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(orchestrator_module, "update_job", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        orchestrator_module,
+        "send_video_processing_complete_email",
+        lambda *args: (
+            notifications.append(args) or SimpleNamespace(success=True, status_code=200)
+        ),
+    )
+    handler_names = {
+        "ingestion", "input_validation", "media_analysis", "audio_extraction",
+        "deepgram_transcription", "transcript_validation", "groq_selection",
+        "candidate_scoring", "clip_extraction", "yolo_detection", "opencv_tracking",
+        "reframing", "captions", "audio_processing", "ffmpeg_rendering",
+        "output_validation", "thumbnail_generation", "export", "cleanup",
+    }
+
+    def finish_exports(context):
+        context.final_exports.extend([{"key": "clip-1"}, {"key": "clip-2"}])
+
+    handlers = {name: lambda _context: None for name in handler_names}
+    handlers["export"] = finish_exports
+
+    PipelineOrchestrator(db, stage_handlers=handlers).process_video("job-1")
+
+    assert notifications == [
+        (email, "Ada", "Okafor", "My finished video", 2)
+    ]
+
+
 def test_selected_clip_detection_flows_through_tracking_to_reframing(tmp_path, monkeypatch):
     class Coordinates(list):
         def tolist(self):

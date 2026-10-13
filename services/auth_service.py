@@ -162,13 +162,13 @@ def claim_email_verification_resend(user_id: str, requester_ip: str | None) -> b
     return True
 
 
-def link_google_account(
+def link_google_account_with_status(
     google_subject: str,
     email: str,
     first_name: str | None = None,
     last_name: str | None = None,
     avatar_url: str | None = None,
-) -> models.User:
+) -> tuple[models.User, bool]:
     normalized_email = _normalize_email(email)
     now = datetime.now(timezone.utc)
     with database.SessionLocal() as db:
@@ -178,6 +178,7 @@ def link_google_account(
             raise ValueError("Google account email belongs to another user.")
         user = user or email_user
 
+        created = user is None
         if user is not None and user.google_id not in (None, google_subject):
             raise ValueError("This email is already linked to a different Google account.")
 
@@ -215,7 +216,24 @@ def link_google_account(
 
         db.commit()
         db.refresh(user)
-        return user
+        return user, created
+
+
+def link_google_account(
+    google_subject: str,
+    email: str,
+    first_name: str | None = None,
+    last_name: str | None = None,
+    avatar_url: str | None = None,
+) -> models.User:
+    user, _created = link_google_account_with_status(
+        google_subject,
+        email,
+        first_name,
+        last_name,
+        avatar_url,
+    )
+    return user
 
 
 def authenticate_user(email: str, password: str) -> models.User | None:

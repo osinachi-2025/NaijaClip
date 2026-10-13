@@ -1,18 +1,22 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Callable
 
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from models import JobStatus, ProcessingJob, VideoStatus
-from services.jobs import JobClaimLost, ensure_job_active, update_job
 from core.config import STORAGE_BACKEND
 from integrations.ffmpeg import FFmpeg
 from integrations.storage import LocalStorage, R2Storage
+from models import JobStatus, ProcessingJob, User, VideoStatus
+from services.jobs import JobClaimLost, ensure_job_active, update_job
+from services.email_service import send_video_processing_complete_email
 from .context import PipelineContext
 from .stages import PipelineStages
+
+logger = logging.getLogger(__name__)
 
 
 class PipelineOrchestrator:
@@ -137,6 +141,28 @@ class PipelineOrchestrator:
             job.completed_at = completed_at
         job.video.status = VideoStatus.COMPLETED
         self.db.commit()
+        user_id = getattr(context.video, "user_id", None)
+        if user_id:
+            owner = self.db.get(User, user_id)
+            if owner is None:
+                logger.warning(
+                    "video completion email skipped because owner was not found video_id=%s",
+                    context.video.id,
+                )
+            else:
+                delivery = send_video_processing_complete_email(
+                    owner.email,
+                    owner.first_name,
+                    owner.last_name,
+                    context.video.title,
+                    len(context.final_exports),
+                )
+                if not delivery.success:
+                    logger.warning(
+                        "video completion email delivery failed video_id=%s status=%s",
+                        context.video.id,
+                        delivery.status_code,
+                    )
         return context
 
 

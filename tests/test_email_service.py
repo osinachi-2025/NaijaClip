@@ -94,6 +94,33 @@ def test_google_account_email_uses_the_same_transactional_delivery_path(monkeypa
     assert seen[0]["subject"] == "Welcome to NaijaClip"
 
 
+def test_video_completion_email_targets_account_and_personalizes_full_name(monkeypatch):
+    sent = []
+    monkeypatch.setattr(email_service, "RESEND_API_KEY", "test-api-key")
+    monkeypatch.setattr(email_service, "MAIL_FROM_EMAIL", "sender@example.com")
+    monkeypatch.setattr(
+        email_service.resend.Emails,
+        "send",
+        lambda params: (sent.append(params) or SimpleNamespace(id="video-ready-1")),
+    )
+
+    result = email_service.send_video_processing_complete_email(
+        "person@gmail.com",
+        "Amina",
+        "O'Neil",
+        '<My "video">',
+        2,
+    )
+
+    assert result.success is True
+    assert sent[0]["to"] == ["person@gmail.com"]
+    assert sent[0]["subject"] == "Your NaijaClip video is ready"
+    assert "Hello Amina O&#x27;Neil" in sent[0]["html"]
+    assert "&lt;My &quot;video&quot;&gt;" in sent[0]["html"]
+    assert 'video "<My "video">"' in sent[0]["text"]
+    assert "2 clips are ready" in sent[0]["text"]
+
+
 def test_password_reset_email_uses_dynamic_code_and_safety_instructions(monkeypatch):
     sent = []
     monkeypatch.setattr(email_service, "RESEND_API_KEY", "test-api-key")
