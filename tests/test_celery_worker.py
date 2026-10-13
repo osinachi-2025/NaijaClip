@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 import models
 from core.config import JOB_TIMEOUT_SECONDS
 from database import Base
+from integrations.groq.client import GroqOutputError
 from services.jobs import (
     JobClaimLost,
     claim_job_for_processing,
@@ -407,6 +408,36 @@ def test_permanent_failure_is_terminal_without_retry(sqlite_db, monkeypatch):
         assert job.status == models.JobStatus.FAILED
         assert job.attempt_count == 1
         assert job.dispatch_retry_at is None
+
+
+def test_exhausted_groq_json_recovery_marks_video_job_failed_with_diagnostics(sqlite_db, monkeypatch):
+    SessionLocal = sessionmaker(bind=sqlite_db, autoflush=False, autocommit=False, expire_on_commit=False)
+    monkeypatch.setattr("workers.tasks.SessionLocal", SessionLocal)
+
+    with Session(sqlite_db, expire_on_commit=False) as db:
+        job = _make_video_job(db)
+        job.queue_id = "groq-json-error-task"
+        db.commit()
+        error = GroqOutputError(
+            "Groq output failure after bounded recovery "
+            "({'model': 'openai/gpt-oss-120b', 'chunk': 2, "
+            "'http_status': 400, 'error_code': 'json_validate_failed'})"
+        )
+        monkeypatch.setattr(
+            "pipeline.orchestrator.PipelineOrchestrator.process_video",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+        )
+
+        result = process_video_job(job.id)
+
+        db.refresh(job)
+        assert result["status"] == "failed"
+        assert job.status == models.JobStatus.FAILED
+        assert job.retryable is False
+        assert job.error_code == "permanent"
+        assert "openai/gpt-oss-120b" in job.internal_error_details
+        assert "json_validate_failed" in job.internal_error_details
+        assert job.video.processing_error == "We couldn't process this video right now. Please try again."
 
 
 def test_worker_loss_redelivery_is_recovered_from_database_state(sqlite_db, monkeypatch):

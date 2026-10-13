@@ -71,6 +71,8 @@ def utcnow() -> datetime:
 
 def classify_failure(error: object | str) -> str:
     text = str(error or "").lower()
+    if any(token in text for token in ("json_validate_failed", "groq output failure", "payload too large")):
+        return "permanent"
     if any(token in text for token in TRANSIENT_FAILURE_PATTERNS):
         return "transient"
     if any(token in text for token in PERMANENT_FAILURE_PATTERNS):

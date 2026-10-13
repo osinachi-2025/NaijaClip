@@ -7,7 +7,7 @@ from core.config import CAMERA_DEAD_ZONE, TRACK_LOST_HOLD_FRAMES
 import pipeline.orchestrator as orchestrator_module
 import pipeline.stages as stages_module
 from pipeline.context import PipelineContext
-from integrations.groq.client import GroqClient
+from integrations.groq.client import GroqClient, GroqOutputError
 from pipeline.orchestrator import PipelineOrchestrator
 from pipeline.scoring import score_candidate
 from pipeline.stages import (
@@ -29,6 +29,28 @@ def scores(value=8):
         "quotability", "engagement_potential", "payoff", "context_independence",
         "clip_efficiency",
     )})
+
+
+def groq_candidate_json(start, end):
+    return json.dumps({
+        "candidates": [{
+            "start": start,
+            "end": end,
+            "reason": "A complete moment",
+            "scores": {field: 8 for field in (
+                "hook", "value", "emotional_impact", "clarity", "story_completeness",
+                "quotability", "engagement_potential", "payoff", "context_independence",
+                "clip_efficiency",
+            )},
+            "semantic_metadata": {
+                "is_complete_thought": True,
+                "ends_on_sentence_boundary": True,
+                "contains_conclusion_or_answer": True,
+                "has_enough_context": True,
+                "natural_pause_detected": True,
+            },
+        }],
+    })
 
 
 def test_invalid_timestamps_are_rejected():
@@ -178,16 +200,8 @@ def test_candidate_generation_chunks_the_full_long_transcript_and_aggregates():
             payload = json.loads(kwargs["messages"][1]["content"])
             calls.append((kwargs["messages"][0]["content"], payload))
             start = payload["timestamped_segments"][0]["s"]
-            scores = {field: 8 for field in (
-                "hook", "value", "emotional_impact", "clarity", "story_completeness",
-                "quotability", "engagement_potential", "payoff", "context_independence", "clip_efficiency",
-            )}
-            content = json.dumps({"candidates": [{
-                "start": start,
-                "end": start + 30,
-                "reason": f"moment at {start}",
-                "scores": scores,
-            }]})
+            end = payload["timestamped_segments"][0]["e"]
+            content = groq_candidate_json(start, end)
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
     client = GroqClient.__new__(GroqClient)
@@ -202,14 +216,142 @@ def test_candidate_generation_chunks_the_full_long_transcript_and_aggregates():
 
     assert len(calls) == 4
     assert [call[1]["timestamped_segments"][0]["s"] for call in calls] == [0, 600, 1200, 1800]
-    assert all("no more than 2 self-contained clips" in call[0] for call in calls)
+    assert all("no more than 2 self-contained, distinct clips" in call[0] for call in calls)
     assert len(result.candidates) == 4
 
     calls.clear()
     client.evaluate_transcript("", [{"start": 0, "end": 2400, "text": "A long complete transcript window."}], 2400)
     assert len(calls) == 1
-    assert "no more than 8 self-contained clips" in calls[0][0]
+    assert "no more than 8 self-contained, distinct clips" in calls[0][0]
     assert calls[0][0].count("Select no more than") == 1
+
+
+def test_gpt_oss_uses_strict_schema_and_recovers_json_validation_failure(caplog):
+    class JsonValidationError(Exception):
+        status_code = 400
+        body = {"error": {"code": "json_validate_failed"}}
+
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise JsonValidationError("Failed to validate JSON")
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=groq_candidate_json(0, 10))
+            )])
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "openai/gpt-oss-120b"
+
+    result = client.evaluate_transcript(
+        "",
+        [{"start": 0, "end": 10, "text": "A private transcript phrase."}],
+        2400,
+    )
+
+    assert len(result.candidates) == 1
+    assert len(calls) == 2
+    assert calls[0]["response_format"]["type"] == "json_schema"
+    assert calls[0]["response_format"]["json_schema"]["strict"] is True
+    assert calls[0]["max_tokens"] == 5400
+    assert calls[1]["max_tokens"] == 3600
+    system_prompt = calls[0]["messages"][0]["content"]
+    assert "no more than 8 self-contained, distinct clips" in system_prompt
+    example_json = system_prompt.split("Use this exact shape: ", 1)[1].split(". Every score", 1)[0]
+    example = json.loads(example_json)
+    assert len(example["candidates"][0]["scores"]) == 10
+    assert len(example["candidates"][0]["semantic_metadata"]) == 5
+    assert "at most 4 distinct" in calls[1]["messages"][0]["content"]
+    assert all(call["messages"][1]["content"].find("A private transcript phrase.") >= 0 for call in calls)
+    assert "serialized_input_bytes" in caplog.text
+    assert "estimated_input_tokens" in caplog.text
+    assert "candidate_count" in caplog.text
+    assert "output_token_budget" in caplog.text
+    assert "http_status': 400" in caplog.text
+    assert "json_validate_failed" in caplog.text
+    assert "A private transcript phrase." not in caplog.text
+
+
+def test_malformed_groq_response_is_retried_once_with_smaller_candidate_count():
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            content = "{ malformed" if len(calls) == 1 else groq_candidate_json(0, 10)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+
+    result = client.evaluate_transcript("", [{"start": 0, "end": 10, "text": "A complete thought."}], 2400)
+
+    assert len(result.candidates) == 1
+    assert len(calls) == 2
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert "no more than 8 self-contained, distinct clips" in calls[0]["messages"][0]["content"]
+    assert "at most 4 distinct" in calls[1]["messages"][0]["content"]
+
+
+def test_exhausted_json_validation_recovery_fails_with_safe_diagnostics():
+    class JsonValidationError(Exception):
+        status_code = 400
+        body = {"error": {"code": "json_validate_failed"}}
+
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            raise JsonValidationError("Failed to validate JSON")
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "openai/gpt-oss-120b"
+
+    with pytest.raises(GroqOutputError, match="json_validate_failed"):
+        client.evaluate_transcript(
+            "",
+            [{"start": 0, "end": 10, "text": "Do not include transcript text in diagnostics."}],
+            2400,
+        )
+
+    assert len(calls) == 2
+    from services.jobs import classify_failure
+
+    assert classify_failure("Groq output failure json_validate_failed") == "permanent"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_code"),
+    [(413, "request_too_large"), (429, "rate_limit_exceeded")],
+)
+def test_groq_payload_and_rate_limit_errors_do_not_use_json_recovery(status_code, error_code):
+    class ProviderError(Exception):
+        def __init__(self):
+            self.status_code = status_code
+            self.body = {"error": {"code": error_code}}
+
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            raise ProviderError()
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "openai/gpt-oss-120b"
+
+    expected_error = GroqOutputError if status_code == 413 else ProviderError
+    with pytest.raises(expected_error):
+        client.evaluate_transcript("", [{"start": 0, "end": 10, "text": "A short segment."}], 2400)
+
+    assert len(calls) == 1
 
 
 def test_long_video_candidate_target_and_selection_cap_are_bounded():
