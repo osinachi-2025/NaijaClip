@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from celery import Celery
 
-from core.config import CELERY_BROKER_URL, CELERY_RESULT_BACKEND, JOB_TIMEOUT_SECONDS, WORKER_CONCURRENCY
+from core.config import (
+    CELERY_BROKER_URL,
+    CELERY_QUEUE,
+    CELERY_RESULT_BACKEND,
+    JOB_TIMEOUT_SECONDS,
+    WORKER_CONCURRENCY,
+)
 
 celery_app = Celery(
     "naijaclip",
@@ -12,7 +18,7 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(
-    task_default_queue="naijaclip",
+    task_default_queue=CELERY_QUEUE,
     task_serializer="json",
     result_serializer="json",
     accept_content=["json"],

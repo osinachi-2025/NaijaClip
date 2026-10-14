@@ -75,10 +75,10 @@ The old database-polling worker is available only with the explicit `NAIJACLIP_E
 5. Start the web application:
 
    ```bash
-   uvicorn app.main:app --reload
+   uvicorn app:app --reload
    ```
 
-   Open <http://localhost:8000>.
+   This serves the dashboard and API. Its startup recovery loop redispatches queued jobs if publishing to Redis fails. Open <http://localhost:8000>.
 
 6. Start a local Celery worker in a second terminal:
 
@@ -88,9 +88,11 @@ The old database-polling worker is available only with the explicit `NAIJACLIP_E
 
    This worker reads job records from the same database and processes them through the existing pipeline and clip export handlers.
 
+   If the local app shares a Redis broker with EC2 but uses a different database or media storage, isolate its queue by setting `CELERY_QUEUE=naijaclip-local` in the local `.env` and starting the worker without a `-Q` override. The API and local worker must use the same queue; leave EC2 on its own queue.
+
 ## Required worker environment variables
 
-The worker and API must use the same production database. Do not use SQLite for a worker on a different host. Set a reachable Redis broker URL explicitly; the code fallback to `localhost` is for local development, not production. These are configuration names and placeholders, not provisioned endpoints or credentials:
+The worker and API must use the same database and storage. Do not use SQLite for a worker on a different host. Set a reachable Redis broker URL explicitly; the code fallback to `localhost` is for local development, not production. If environments with different databases share Redis, configure different `CELERY_QUEUE` values. These are configuration names and placeholders, not provisioned endpoints or credentials:
 
 ```dotenv
 DATABASE_URL=<same SQLAlchemy database URL used by the API>
@@ -106,6 +108,10 @@ GROQ_API_KEY=<Groq API key for video-analysis jobs>
 ```
 
 `R2_ENDPOINT_URL` may instead be derived from `R2_ACCOUNT_ID`. If `STORAGE_BACKEND=local`, API and worker must share the same `MEDIA_ROOT` filesystem. Video-analysis jobs require Deepgram and Groq credentials; clip-render jobs use storage and FFmpeg/FFprobe. `WORKER_CONCURRENCY` is optional when the command sets `--concurrency`, and `CELERY_RESULT_BACKEND` is optional because job state and the Celery task ID are stored in the database. Worker tasks do not require JWT, Google, or Paystack credentials. Store actual production values in a secrets file outside version control.
+
+Groq calls use the same Redis service for a shared per-model request/token bucket across worker processes. `GROQ_RATE_LIMIT_REDIS_URL` defaults to `CELERY_BROKER_URL`; every API/worker environment using the same Groq account and model must use the same Redis URL, key prefix, and conservative quota settings. Set `GROQ_RATE_LIMIT_REQUESTS_PER_MINUTE` and `GROQ_RATE_LIMIT_TOKENS_PER_MINUTE` at or below the Groq account's actual limits. Token counts are conservative estimates, not provider tokenizer output. Requests over the shared bucket are deferred through database job retry scheduling rather than sleeping in the worker.
+
+`GROQ_MAX_INPUT_TOKENS` bounds transcript windows (default 5,000 estimated prompt tokens). Transcript windows retain original timestamps, prefer sentence boundaries, and include a prior sentence as context when it fits. Successfully generated window candidates are checkpointed in `processing_jobs.groq_selection_state`; a retry revalidates and reuses those candidates. HTTP 429 retries honor `Retry-After` and request/token reset headers. If none is usable, `GROQ_429_FALLBACK_SECONDS` (60 by default) is used, with bounded exponential backoff and positive jitter through `GROQ_429_MAX_BACKOFF_SECONDS` and `GROQ_429_JITTER_SECONDS`. Retries remain bounded by each job's `max_attempts`.
 
 Dashboard clips, thumbnails, editor sources, and edited exports are streamed through owner-authorized API routes. Keep the R2 bucket private and disable public `r2.dev` or custom-domain access; featured homepage clips are streamed separately only after an administrator features them. `R2_PUBLIC_URL` is not required for dashboard playback.
 
@@ -155,7 +161,7 @@ sudo systemctl status naijaclip-celery
 journalctl -u naijaclip-celery -f
 ```
 
-The worker service runs Celery only; do not add either legacy polling command to systemd, cron, or another process manager. Run `alembic upgrade head` against the shared production database before starting the new code so the dispatch lease columns exist.
+The worker service runs Celery only; do not add either legacy polling command to systemd, cron, or another process manager. Run `alembic upgrade head` against the shared production database before starting the new code so the dispatch lease and Groq chunk-checkpoint columns exist.
 
 ## Retries, recovery, and duplicates
 
@@ -163,7 +169,33 @@ The job row is the durable dispatch record and remains the source of truth. The 
 
 The API checks at most 100 due jobs per recovery pass, every 30 seconds by default. It retries unpublished rows and republishes queued rows whose recorded publication has remained unclaimed for `JOB_TIMEOUT_SECONDS` (30 minutes by default). A successful publish followed by a failed database update can therefore publish twice after the dispatch lease expires; the atomic `QUEUED` to `INGESTING` claim ensures only one delivery executes. The lease and recovery interval are configurable with `JOB_DISPATCH_LEASE_SECONDS` and `JOB_RECOVERY_INTERVAL_SECONDS`.
 
-Processing attempts are bounded by each job's `max_attempts` (3 by default). Transient errors are requeued with backoff; permanent errors and exhausted attempts become terminal `FAILED` jobs. Celery late acknowledgements and worker-loss rejection are enabled. A worker heartbeat continues during long stages; after it expires plus `JOB_RECOVERY_GRACE_SECONDS` (120 seconds by default), API recovery requeues the job or marks it failed if the attempt budget is exhausted. The grace period exceeds the Celery hard task limit, and stage/completion writes are fenced by the current worker ID so a stale attempt cannot overwrite a replacement attempt. Soft and hard task limits are based on `JOB_TIMEOUT_SECONDS`.
+Processing attempts are bounded by each job's `max_attempts` (3 by default). Transient errors are requeued with backoff; Groq 429 delays are stored in `dispatch_retry_at` and published by API recovery only when due. Permanent errors and exhausted attempts become terminal `FAILED` jobs and are raised to Celery as task failures. Celery late acknowledgements and worker-loss rejection are enabled. A worker heartbeat continues during long stages; after it expires plus `JOB_RECOVERY_GRACE_SECONDS` (120 seconds by default), API recovery requeues the job or marks it failed if the attempt budget is exhausted. The grace period exceeds the Celery hard task limit, and stage/completion writes are fenced by the current worker ID so a stale attempt cannot overwrite a replacement attempt. Soft and hard task limits are based on `JOB_TIMEOUT_SECONDS`.
+
+Deploy Groq retry/checkpoint changes in this order:
+
+1. Take a production database backup/snapshot.
+2. Deploy this application revision to the API and worker hosts. Keep `DATABASE_URL` and Celery broker/queue settings consistent across the deployment; every worker using the same Groq quota must share `GROQ_RATE_LIMIT_REDIS_URL`, `GROQ_RATE_LIMIT_KEY_PREFIX`, request/token limits, and Groq credentials. The rate-limit Redis URL may be omitted when `CELERY_BROKER_URL` points to the shared Redis service.
+3. Before restarting either service, run the additive migration from the production checkout:
+
+   ```bash
+   cd /srv/naijaclip
+   set -a
+   . /etc/naijaclip/.env
+   set +a
+   source .venv/bin/activate
+   alembic upgrade head
+   ```
+
+4. Restart the API using its existing service/process manager so its job-recovery loop can publish due retries, then restart the Celery worker:
+
+   ```bash
+   sudo systemctl restart naijaclip-celery
+   sudo systemctl status naijaclip-celery
+   celery -A workers.celery_app inspect ping
+   journalctl -u naijaclip-celery -f
+   ```
+
+Do not run workers against the database before the migration or use different Redis rate-limit URLs/prefixes for workers sharing the same Groq quota.
 
 ## Tests
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import os
 import subprocess
 import sys
@@ -9,15 +11,19 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+import app as web_app
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 import models
-from core.config import JOB_TIMEOUT_SECONDS
+from core.config import CELERY_QUEUE, JOB_TIMEOUT_SECONDS
 from database import Base
-from integrations.groq.client import GroqOutputError
+from integrations.groq.client import GroqOutputError, GroqRateLimitError
+import pipeline.stages as pipeline_stages_module
+from pipeline.context import PipelineContext
 from services.jobs import (
     JobClaimLost,
+    claim_next_job,
     claim_job_for_processing,
     dispatch_processing_job,
     fail_job,
@@ -77,8 +83,28 @@ def _complete_job(db: Session, job_id: str) -> None:
 def test_celery_app_initializes_and_registers_tasks():
     assert celery_app is not None
     assert celery_app.conf.broker_url
+    assert celery_app.conf.task_default_queue == CELERY_QUEUE
     assert "workers.tasks.process_video_job" in celery_app.tasks
     assert "workers.tasks.process_clip_export_job" in celery_app.tasks
+
+
+def test_dashboard_app_starts_and_stops_job_recovery(monkeypatch):
+    dashboard_module = web_app._dashboard_module
+    calls = []
+
+    async def recovery_loop():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(dashboard_module, "initialize_database", lambda: calls.append("database"))
+    monkeypatch.setattr(dashboard_module, "_recover_jobs", lambda: calls.append("recover"))
+    monkeypatch.setattr(dashboard_module, "_run_job_recovery", recovery_loop)
+
+    async def run_lifecycle():
+        dashboard_module.create_schema()
+        assert calls == ["database", "recover"]
+        await dashboard_module.stop_job_recovery()
+
+    asyncio.run(run_lifecycle())
 
 
 def test_dispatch_processing_job_sets_task_id_for_queued_job(sqlite_db, monkeypatch):
@@ -200,6 +226,11 @@ def test_recover_unpublished_jobs_dispatches_queued_jobs(sqlite_db, monkeypatch)
 
         assert recovered == [job.id]
         assert called == [job.id]
+
+
+def test_recover_stalled_jobs_uses_default_timeout(sqlite_db):
+    with Session(sqlite_db, expire_on_commit=False) as db:
+        assert recover_stalled_jobs(db) == []
 
 
 def test_redis_failure_is_recovered_by_a_later_session(sqlite_db, monkeypatch):
@@ -379,10 +410,10 @@ def test_retry_exhaustion_marks_job_failed(sqlite_db, monkeypatch):
             lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("network timeout")),
         )
 
-        result = process_video_job(job.id)
+        with pytest.raises(TimeoutError, match="network timeout"):
+            process_video_job(job.id)
 
         db.refresh(job)
-        assert result["status"] == "failed"
         assert job.status == models.JobStatus.FAILED
         assert job.attempt_count == 1
         assert job.queue_id is None
@@ -401,10 +432,10 @@ def test_permanent_failure_is_terminal_without_retry(sqlite_db, monkeypatch):
             lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("unsupported video format")),
         )
 
-        result = process_video_job(job.id)
+        with pytest.raises(ValueError, match="unsupported video format"):
+            process_video_job(job.id)
 
         db.refresh(job)
-        assert result["status"] == "failed"
         assert job.status == models.JobStatus.FAILED
         assert job.attempt_count == 1
         assert job.dispatch_retry_at is None
@@ -428,16 +459,155 @@ def test_exhausted_groq_json_recovery_marks_video_job_failed_with_diagnostics(sq
             lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
         )
 
-        result = process_video_job(job.id)
+        with pytest.raises(GroqOutputError, match="json_validate_failed"):
+            process_video_job(job.id)
 
         db.refresh(job)
-        assert result["status"] == "failed"
         assert job.status == models.JobStatus.FAILED
         assert job.retryable is False
         assert job.error_code == "permanent"
         assert "openai/gpt-oss-120b" in job.internal_error_details
         assert "json_validate_failed" in job.internal_error_details
         assert job.video.processing_error == "We couldn't process this video right now. Please try again."
+
+
+def test_groq_429_uses_persisted_delayed_retry_and_preserves_job_status(sqlite_db, monkeypatch):
+    SessionLocal = sessionmaker(bind=sqlite_db, autoflush=False, autocommit=False, expire_on_commit=False)
+    monkeypatch.setattr("workers.tasks.SessionLocal", SessionLocal)
+    monkeypatch.setattr("services.jobs.random.uniform", lambda _low, _high: 0)
+
+    with Session(sqlite_db, expire_on_commit=False) as db:
+        job = _make_video_job(db, max_attempts=2)
+        job.queue_id = "groq-rate-limit-task"
+        db.commit()
+        calls = []
+        limit_error = GroqRateLimitError(8, {"provider_message": "slow down"})
+
+        def fail_then_succeed(orchestrator, job_id):
+            calls.append(job_id)
+            if len(calls) == 1:
+                raise limit_error
+            _complete_job(orchestrator.db, job_id)
+
+        monkeypatch.setattr("pipeline.orchestrator.PipelineOrchestrator.process_video", fail_then_succeed)
+
+        assert process_video_job(job.id)["status"] == "retrying"
+        db.refresh(job)
+        assert job.status == models.JobStatus.QUEUED
+        assert job.video.status == models.VideoStatus.QUEUED
+        assert job.current_stage == "retry_waiting"
+        assert job.queue_id is None
+        retry_at = job.dispatch_retry_at.replace(tzinfo=timezone.utc) if job.dispatch_retry_at.tzinfo is None else job.dispatch_retry_at
+        assert (retry_at - utcnow()).total_seconds() >= 59
+        assert process_video_job(job.id)["status"] == "duplicate"
+        assert calls == [job.id]
+
+        published = []
+        monkeypatch.setattr("workers.tasks.celery_app.send_task", lambda *_args, **_kwargs: published.append(job.id))
+        assert recover_unpublished_jobs(db) == []
+        assert published == []
+
+        job.dispatch_retry_at = utcnow() - timedelta(seconds=1)
+        db.commit()
+
+        class FakeResult:
+            id = "after-rate-limit"
+
+        monkeypatch.setattr("workers.tasks.celery_app.send_task", lambda *_args, **_kwargs: FakeResult())
+        assert recover_unpublished_jobs(db) == [job.id]
+        assert process_video_job(job.id)["status"] == "completed"
+        assert calls == [job.id, job.id]
+
+
+def test_groq_429_retry_budget_exhaustion_marks_failed_task_as_error(sqlite_db, monkeypatch):
+    SessionLocal = sessionmaker(bind=sqlite_db, autoflush=False, autocommit=False, expire_on_commit=False)
+    monkeypatch.setattr("workers.tasks.SessionLocal", SessionLocal)
+
+    with Session(sqlite_db, expire_on_commit=False) as db:
+        job = _make_video_job(db, max_attempts=1)
+        job.queue_id = "last-groq-rate-limit-task"
+        db.commit()
+        error = GroqRateLimitError(60)
+        monkeypatch.setattr(
+            "pipeline.orchestrator.PipelineOrchestrator.process_video",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+        )
+
+        with pytest.raises(GroqRateLimitError):
+            process_video_job(job.id)
+
+        db.refresh(job)
+        assert job.status == models.JobStatus.FAILED
+        assert job.retryable is False
+        assert job.attempt_count == 1
+
+
+def test_legacy_job_claim_does_not_bypass_persisted_retry_delay(sqlite_db):
+    with Session(sqlite_db, expire_on_commit=False) as db:
+        job = _make_video_job(db)
+        job.dispatch_retry_at = utcnow() + timedelta(seconds=60)
+        db.commit()
+
+        assert claim_next_job(db) is None
+        db.refresh(job)
+        assert job.status == models.JobStatus.QUEUED
+        assert job.attempt_count == 0
+
+
+def test_groq_retry_backoff_is_bounded_but_never_shortens_provider_delay(monkeypatch):
+    import services.jobs as jobs_module
+
+    monkeypatch.setattr(jobs_module, "GROQ_429_FALLBACK_SECONDS", 60)
+    monkeypatch.setattr(jobs_module, "GROQ_429_MAX_BACKOFF_SECONDS", 120)
+    monkeypatch.setattr(jobs_module, "GROQ_429_JITTER_SECONDS", 5)
+    monkeypatch.setattr(jobs_module.random, "uniform", lambda _low, _high: 3)
+
+    assert jobs_module._retry_delay_seconds(GroqRateLimitError(1), 8) == 123
+    assert jobs_module._retry_delay_seconds(GroqRateLimitError(180), 8) == 183
+
+
+def test_groq_chunk_checkpoint_persists_progress_and_is_worker_fenced(sqlite_db, monkeypatch):
+    with Session(sqlite_db, expire_on_commit=False) as db:
+        job = _make_video_job(db)
+        worker_id = "celery:groq-checkpoint"
+        assert claim_job_for_processing(db, job.id, worker_id=worker_id) is not None
+        update_job(
+            db,
+            job.id,
+            status=models.JobStatus.SELECTING,
+            stage="groq_selection",
+            progress=45,
+            worker_id=worker_id,
+        )
+        context = PipelineContext(
+            job=job,
+            video=job.video,
+            media_info={"format": {"duration": 120}},
+            transcript="An original timestamped transcript.",
+            transcript_segments=[{"start": 0, "end": 10, "text": "An original sentence."}],
+        )
+
+        class FakeGroqClient:
+            def evaluate_transcript(self, *_args, on_chunk_complete=None, **_kwargs):
+                on_chunk_complete({"stable-chunk-key": []}, 1, 2)
+                raise GroqRateLimitError(60)
+
+        monkeypatch.setattr(pipeline_stages_module, "GroqClient", FakeGroqClient)
+        stages = pipeline_stages_module.PipelineStages(
+            db,
+            storage=None,
+            ffmpeg=SimpleNamespace(),
+            worker_id=worker_id,
+        )
+
+        with pytest.raises(GroqRateLimitError):
+            stages.groq_selection(context)
+
+        db.refresh(job)
+        assert job.status == models.JobStatus.SELECTING
+        assert job.progress == 47
+        assert job.worker_id == worker_id
+        assert '"stable-chunk-key"' in job.groq_selection_state
 
 
 def test_worker_loss_redelivery_is_recovered_from_database_state(sqlite_db, monkeypatch):

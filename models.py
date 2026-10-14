@@ -856,6 +856,8 @@ class ProcessingJob(Base):
         Text
     )
 
+    groq_selection_state: Mapped[Optional[str]] = mapped_column(Text)
+
     retryable: Mapped[bool] = mapped_column(
         Boolean,
         default=False,

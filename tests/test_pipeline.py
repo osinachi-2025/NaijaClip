@@ -7,7 +7,8 @@ from core.config import CAMERA_DEAD_ZONE, TRACK_LOST_HOLD_FRAMES
 import pipeline.orchestrator as orchestrator_module
 import pipeline.stages as stages_module
 from pipeline.context import PipelineContext
-from integrations.groq.client import GroqClient, GroqOutputError
+from integrations.groq.client import GROQ_CANDIDATE_JSON_SCHEMA, GroqClient, GroqOutputError, GroqRateLimitError
+from integrations.groq.rate_limit import GroqRateLimiter
 from pipeline.orchestrator import PipelineOrchestrator
 from pipeline.scoring import score_candidate
 from pipeline.stages import (
@@ -226,10 +227,194 @@ def test_candidate_generation_chunks_the_full_long_transcript_and_aggregates():
     assert calls[0][0].count("Select no more than") == 1
 
 
+def test_token_aware_chunks_prefer_sentence_boundaries_and_keep_timestamped_context(monkeypatch):
+    monkeypatch.setattr("integrations.groq.client.GROQ_MAX_INPUT_TOKENS", 500)
+    segments = [
+        {"start": 0, "end": 10, "text": "alpha " * 115 + "end."},
+        {"start": 10, "end": 20, "text": "beta " * 115 + "end."},
+        {"start": 20, "end": 30, "text": "gamma " * 115 + "end."},
+    ]
+
+    chunks = GroqClient._chunk_segments(segments)
+
+    assert len(chunks) == 2
+    assert chunks[0][-1] == chunks[1][0]
+    assert chunks[0][-1]["s"] == 10
+    assert all(
+        GroqClient._estimate_tokens(json.dumps(chunk, separators=(",", ":"), ensure_ascii=False)) <= 500
+        for chunk in chunks
+    )
+    assert all(item["s"] in {0, 10, 20} and item["e"] == item["s"] + 10 for chunk in chunks for item in chunk)
+
+
+def test_successful_chunks_are_reused_after_a_later_chunk_fails(monkeypatch):
+    chunks = [[{"s": 0, "e": 10, "t": "First sentence."}], [{"s": 10, "e": 20, "t": "Second sentence."}]]
+    monkeypatch.setattr(GroqClient, "_chunk_segments", staticmethod(lambda _segments: chunks))
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            payload = json.loads(kwargs["messages"][1]["content"])
+            start = payload["timestamped_segments"][0]["s"]
+            calls.append(start)
+            if start == 10 and calls.count(10) == 1:
+                raise ConnectionError("temporary network issue")
+            end = payload["timestamped_segments"][-1]["e"]
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=groq_candidate_json(start, end))
+            )])
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+    checkpoints = []
+
+    with pytest.raises(ConnectionError):
+        client.evaluate_transcript(
+            "",
+            [],
+            20,
+            on_chunk_complete=lambda state, completed, total: checkpoints.append((state, completed, total)),
+        )
+
+    assert calls == [0, 10]
+    assert len(checkpoints) == 1
+    saved_chunks = checkpoints[0][0]
+    result = client.evaluate_transcript("", [], 20, cached_chunks=saved_chunks)
+
+    assert calls == [0, 10, 10]
+    assert [candidate.start for candidate in result.candidates] == [0, 10]
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected_delay"),
+    [
+        ({"Retry-After": "12", "x-ratelimit-reset-tokens": "25s"}, 25),
+        ({"x-ratelimit-reset-requests": "17s"}, 17),
+    ],
+)
+def test_groq_429_uses_provider_delay_without_immediate_retry(headers, expected_delay):
+    class ProviderError(Exception):
+        status_code = 429
+        body = {
+            "error": {
+                "code": "rate_limit_exceeded",
+                "message": "Wait before retrying; credential gsk_secret-value.",
+            }
+        }
+        response = SimpleNamespace(headers=headers)
+
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            raise ProviderError()
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+
+    with pytest.raises(GroqRateLimitError) as raised:
+        client.evaluate_transcript("", [{"start": 0, "end": 10, "text": "Private transcript."}], 20)
+
+    assert raised.value.retry_after_seconds == expected_delay
+    assert "gsk_secret-value" not in str(raised.value)
+    assert "Private transcript." not in str(raised.value)
+    assert len(calls) == 1
+
+
+def test_groq_429_without_usable_header_uses_configurable_fallback(monkeypatch):
+    monkeypatch.setattr("core.config.GROQ_429_FALLBACK_SECONDS", 60)
+
+    class ProviderError(Exception):
+        status_code = 429
+        body = {"error": {"code": "rate_limit_exceeded", "message": "Try later."}}
+        response = SimpleNamespace(headers={"Retry-After": "not-a-delay"})
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            raise ProviderError()
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+
+    with pytest.raises(GroqRateLimitError) as raised:
+        client.evaluate_transcript("", [{"start": 0, "end": 10, "text": "A sentence."}], 20)
+
+    assert raised.value.retry_after_seconds == 60
+
+
+def test_multiple_groq_rate_limiter_instances_share_request_and_token_budget():
+    class SharedRedis:
+        def __init__(self):
+            self.requests = {}
+            self.tokens = {}
+            self.cooldowns = {}
+
+        def eval(self, _script, key_count, *args):
+            if key_count == 1:
+                key, delay_ms = args
+                self.cooldowns[key] = max(self.cooldowns.get(key, 0), delay_ms)
+                return self.cooldowns[key]
+            request_key, token_key, cooldown_key, request_limit, token_limit, token_cost = args
+            if self.cooldowns.get(cooldown_key, 0):
+                return [0, self.cooldowns[cooldown_key]]
+            request_count = self.requests.get(request_key, request_limit)
+            token_count = self.tokens.get(token_key, token_limit)
+            if request_count < 1 or token_count < token_cost:
+                return [0, 60000]
+            self.requests[request_key] = request_count - 1
+            self.tokens[token_key] = token_count - token_cost
+            return [1, 0]
+
+    shared_redis = SharedRedis()
+    worker_a = GroqRateLimiter(redis_client=shared_redis, model="same-model", requests_per_minute=1, tokens_per_minute=1000)
+    worker_b = GroqRateLimiter(redis_client=shared_redis, model="same-model", requests_per_minute=1, tokens_per_minute=1000)
+
+    assert worker_a.acquire(900) == 0
+    assert worker_b.acquire(100) == 60
+    worker_a.defer_all_workers(75)
+    assert worker_b.acquire(100) == 75
+
+
+def test_groq_strict_schema_uses_supported_structured_output_subset():
+    allowed_types = {"object", "array", "string", "number", "integer", "boolean"}
+
+    def check_schema(schema):
+        assert schema["type"] in allowed_types
+        assert set(schema) <= {"type", "properties", "items", "required", "additionalProperties"}
+        if schema["type"] == "object":
+            assert schema["additionalProperties"] is False
+            assert set(schema["required"]) == set(schema["properties"])
+            for property_schema in schema["properties"].values():
+                check_schema(property_schema)
+        elif schema["type"] == "array":
+            check_schema(schema["items"])
+
+    check_schema(GROQ_CANDIDATE_JSON_SCHEMA)
+    response_format = GroqClient.__new__(GroqClient)
+    response_format.model = "openai/gpt-oss-20b"
+    request_format = response_format._response_format()
+    assert request_format["type"] == "json_schema"
+    assert request_format["json_schema"]["strict"] is True
+    assert request_format["json_schema"]["schema"] is GROQ_CANDIDATE_JSON_SCHEMA
+    assert len(GROQ_CANDIDATE_JSON_SCHEMA["properties"]["candidates"]["items"]["properties"]["scores"]["properties"]) == 10
+    assert len(GROQ_CANDIDATE_JSON_SCHEMA["properties"]["candidates"]["items"]["properties"]["semantic_metadata"]["properties"]) == 5
+
+
 def test_gpt_oss_uses_strict_schema_and_recovers_json_validation_failure(caplog):
     class JsonValidationError(Exception):
         status_code = 400
-        body = {"error": {"code": "json_validate_failed"}}
+        body = {
+            "error": {
+                "code": "json_validate_failed",
+                "message": "Invalid schema near A private transcript phrase.",
+                "param": "response_format",
+                "details": {"keyword": "required", "transcript": "A private transcript phrase."},
+            }
+        }
 
     calls = []
 
@@ -257,6 +442,7 @@ def test_gpt_oss_uses_strict_schema_and_recovers_json_validation_failure(caplog)
     assert calls[0]["response_format"]["type"] == "json_schema"
     assert calls[0]["response_format"]["json_schema"]["strict"] is True
     assert calls[0]["max_tokens"] == 5400
+    assert calls[1]["response_format"] == {"type": "json_object"}
     assert calls[1]["max_tokens"] == 3600
     system_prompt = calls[0]["messages"][0]["content"]
     assert "no more than 8 self-contained, distinct clips" in system_prompt
@@ -272,6 +458,8 @@ def test_gpt_oss_uses_strict_schema_and_recovers_json_validation_failure(caplog)
     assert "output_token_budget" in caplog.text
     assert "http_status': 400" in caplog.text
     assert "json_validate_failed" in caplog.text
+    assert "Invalid schema near [redacted]" in caplog.text
+    assert "provider_param" in caplog.text
     assert "A private transcript phrase." not in caplog.text
 
 
@@ -295,6 +483,28 @@ def test_malformed_groq_response_is_retried_once_with_smaller_candidate_count():
     assert calls[0]["response_format"] == {"type": "json_object"}
     assert "no more than 8 self-contained, distinct clips" in calls[0]["messages"][0]["content"]
     assert "at most 4 distinct" in calls[1]["messages"][0]["content"]
+
+
+def test_ungrounded_groq_timestamps_are_rejected_and_retried_with_grounding():
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            start, end = (1, 11) if len(calls) == 1 else (0, 10)
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=groq_candidate_json(start, end))
+            )])
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+
+    result = client.evaluate_transcript("", [{"start": 0, "end": 10, "text": "A complete thought."}], 2400)
+
+    assert len(result.candidates) == 1
+    assert result.candidates[0].start == 0
+    assert len(calls) == 2
 
 
 def test_exhausted_json_validation_recovery_fails_with_safe_diagnostics():
@@ -347,7 +557,7 @@ def test_groq_payload_and_rate_limit_errors_do_not_use_json_recovery(status_code
     client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     client.model = "openai/gpt-oss-120b"
 
-    expected_error = GroqOutputError if status_code == 413 else ProviderError
+    expected_error = GroqOutputError if status_code == 413 else GroqRateLimitError
     with pytest.raises(expected_error):
         client.evaluate_transcript("", [{"start": 0, "end": 10, "text": "A short segment."}], 2400)
 

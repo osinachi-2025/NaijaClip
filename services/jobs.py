@@ -1,14 +1,25 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
+import random
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from sqlalchemy import case, func, or_, select, update
 from sqlalchemy.orm import Session
 
-from core.config import CELERY_RETRY_BACKOFF_SECONDS, JOB_DISPATCH_LEASE_SECONDS, JOB_TIMEOUT_SECONDS, MAX_RETRIES
+from core.config import (
+    CELERY_RETRY_BACKOFF_SECONDS,
+    GROQ_429_FALLBACK_SECONDS,
+    GROQ_429_JITTER_SECONDS,
+    GROQ_429_MAX_BACKOFF_SECONDS,
+    JOB_DISPATCH_LEASE_SECONDS,
+    JOB_RECOVERY_GRACE_SECONDS,
+    JOB_TIMEOUT_SECONDS,
+    MAX_RETRIES,
+)
 from core.error_handling import sanitize_error_message
 from models import ClipExport, ExportStatus, JobStatus, JobType, ProcessingJob, VideoStatus
 
@@ -41,6 +52,7 @@ TRANSIENT_FAILURE_PATTERNS = (
 )
 
 PERMANENT_FAILURE_PATTERNS = (
+    "rate limiter configuration",
     "unsupported format",
     "unsupported video",
     "no such file or directory",
@@ -89,6 +101,20 @@ def should_retry_job(error: object | str, *, attempt_count: int = 0, max_attempt
     return classify_failure(error) == "transient" and attempt_count < max_attempts
 
 
+def _retry_delay_seconds(error: object, attempt_count: int) -> float:
+    provider_delay = getattr(error, "retry_after_seconds", None)
+    if provider_delay is None:
+        return min(CELERY_RETRY_BACKOFF_SECONDS * max(1, attempt_count), 300)
+    max_exponent = max(
+        0,
+        math.ceil(math.log2(GROQ_429_MAX_BACKOFF_SECONDS / GROQ_429_FALLBACK_SECONDS)),
+    )
+    exponent = min(max(0, attempt_count - 1), max_exponent)
+    exponential = min(GROQ_429_FALLBACK_SECONDS * (2 ** exponent), GROQ_429_MAX_BACKOFF_SECONDS)
+    base_delay = max(float(provider_delay), exponential)
+    return base_delay + random.uniform(0.0, GROQ_429_JITTER_SECONDS)
+
+
 def claim_next_job(db: Session, worker_id: str | None = None) -> ProcessingJob | None:
     worker_id = worker_id or f"worker-{os.getpid()}"
     with db.begin():
@@ -97,6 +123,7 @@ def claim_next_job(db: Session, worker_id: str | None = None) -> ProcessingJob |
             .where(
                 ProcessingJob.status == JobStatus.QUEUED,
                 ProcessingJob.attempt_count < ProcessingJob.max_attempts,
+                or_(ProcessingJob.dispatch_retry_at.is_(None), ProcessingJob.dispatch_retry_at <= utcnow()),
             )
             .order_by(ProcessingJob.created_at)
             .with_for_update(skip_locked=True)
@@ -144,6 +171,10 @@ def claim_job_for_processing(db: Session, job_id: str, worker_id: str | None = N
                 ProcessingJob.status == JobStatus.QUEUED,
                 ProcessingJob.cancelled_at.is_(None),
                 ProcessingJob.attempt_count < ProcessingJob.max_attempts,
+                or_(
+                    ProcessingJob.dispatch_retry_at.is_(None),
+                    ProcessingJob.dispatch_retry_at <= now,
+                ),
             )
             .values(
                 status=JobStatus.INGESTING,
@@ -486,11 +517,7 @@ def fail_job(
                 dispatch_published_at=None,
                 dispatch_token=None,
                 dispatch_lease_until=None,
-                dispatch_retry_at=(
-                    now + timedelta(seconds=min(CELERY_RETRY_BACKOFF_SECONDS * max(1, job.attempt_count), 300))
-                    if retryable
-                    else None
-                ),
+                dispatch_retry_at=now + timedelta(seconds=_retry_delay_seconds(error, job.attempt_count)) if retryable else None,
                 worker_id=None,
                 claimed_at=None,
             )
@@ -537,8 +564,7 @@ def fail_job(
     if retryable:
         job.status = new_status
         job.current_stage = "retry_waiting"
-        retry_seconds = min(CELERY_RETRY_BACKOFF_SECONDS * max(1, job.attempt_count), 300)
-        job.dispatch_retry_at = now + timedelta(seconds=retry_seconds)
+        job.dispatch_retry_at = now + timedelta(seconds=_retry_delay_seconds(error, job.attempt_count))
         if job.job_type == JobType.CLIP_RENDER:
             clip_export = db.scalar(select(ClipExport).where(ClipExport.processing_job_id == job.id))
             if clip_export is not None:

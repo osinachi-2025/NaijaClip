@@ -541,15 +541,22 @@ def test_email_verification_tokens_expire_and_are_single_use(tmp_path, monkeypat
     assert verify_email_token(valid_token) is None
 
 
-def test_register_and_login_templates_expose_resend_and_strength_controls():
+def test_register_and_login_templates_expose_resend_and_strength_controls(monkeypatch):
+    monkeypatch.setattr(web_app._dashboard_module, "initialize_database", lambda: None)
+    monkeypatch.setattr(web_app._dashboard_module, "_recover_jobs", lambda: None)
     with TestClient(web_app.app) as client:
         registration = client.get("/register")
         login = client.get("/login")
 
     assert 'src="/static/js/password-strength.js"' in registration.text
+    assert 'src="/static/js/password-visibility.js"' in registration.text
+    assert 'data-password-target="password"' in registration.text
+    assert 'data-password-target="confirm_password"' in registration.text
     assert 'id="password-strength-label"' in registration.text
     assert 'id="resend-verification"' in login.text
     assert "/auth/resend-verification" in login.text
+    assert 'src="/static/js/password-visibility.js"' in login.text
+    assert 'data-password-target="password"' in login.text
 
 
 def test_password_reset_reports_provider_failure_without_provider_detail(tmp_path, monkeypatch):

@@ -42,6 +42,22 @@ a { color: inherit; text-decoration: none; }
 .nc-password-strength[data-level="2"] .nc-password-strength-track span { background: #c77a20; }
 .nc-password-strength[data-level="3"] .nc-password-strength-track span { background: #277d68; }
 .nc-password-strength[data-level="4"] .nc-password-strength-track span { background: #0e5c52; }
+.nc-password-control { position: relative; }
+.nc-password-control input { padding-right: 66px; }
+.nc-password-toggle {
+  position: absolute;
+  top: 50%;
+  right: 13px;
+  transform: translateY(-50%);
+  padding: 0;
+  border: 0;
+  color: var(--accent-dark);
+  background: transparent;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+}
 .nc-verification-resend { display: grid; justify-items: center; gap: 6px; margin-top: 16px; text-align: center; font-size: 13px; }
 .nc-verification-resend p { margin: 0; color: var(--muted); }
 .nc-verification-resend span { color: var(--ink-soft); }
@@ -674,5 +690,4 @@ a { color: inherit; text-decoration: none; }
   .nc-editor-subtitle { font-size: 15px; }
   .nc-editor-warning { grid-column: 1 / -1; }
 }
-
 

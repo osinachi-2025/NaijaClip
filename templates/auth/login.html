@@ -271,7 +271,10 @@
 
           <div class="nc-field">
             <label for="password">Password</label>
-            <input id="password" type="password" placeholder="Enter your password" required />
+            <div class="nc-password-control">
+              <input id="password" type="password" placeholder="Enter your password" required />
+              <button type="button" class="nc-password-toggle" data-password-target="password" data-password-label="password" aria-label="Show password">Show</button>
+            </div>
           </div>
 
           <div class="nc-row">
@@ -302,6 +305,7 @@
     </main>
 
     <script src="/static/js/auth.js"></script>
+    <script src="/static/js/password-visibility.js"></script>
     <script>
       const googleBtn = document.querySelector('.nc-google-btn');
       const form = document.getElementById('nc-login-form');

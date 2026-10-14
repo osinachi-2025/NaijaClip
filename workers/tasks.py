@@ -82,7 +82,9 @@ def process_video_job(self, job_id: str) -> dict[str, str]:
             except JobClaimLost:
                 logger.info("discarding failure from stale attempt job=%s", job_id)
                 return {"job_id": job_id, "status": "ownership_lost"}
-            return {"job_id": job_id, "status": "retrying" if retry_scheduled else "failed"}
+            if retry_scheduled:
+                return {"job_id": job_id, "status": "retrying"}
+            raise
 
         return {"job_id": job_id, "status": "completed"}
     finally:
@@ -125,7 +127,9 @@ def process_clip_export_job(self, job_id: str) -> dict[str, str]:
             except JobClaimLost:
                 logger.info("discarding failure from stale clip export attempt job=%s", job_id)
                 return {"job_id": job_id, "status": "ownership_lost"}
-            return {"job_id": job_id, "status": "retrying" if retry_scheduled else "failed"}
+            if retry_scheduled:
+                return {"job_id": job_id, "status": "retrying"}
+            raise
 
         return {"job_id": job_id, "status": "completed"}
     finally:

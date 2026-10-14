@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,6 +65,19 @@ def dashboard_context(request: Request) -> dict:
 @app.on_event("startup")
 def create_schema() -> None:
     initialize_database()
+    _recover_jobs()
+    app.state.job_recovery_task = asyncio.create_task(_run_job_recovery())
+
+
+@app.on_event("shutdown")
+async def stop_job_recovery() -> None:
+    task = getattr(app.state, "job_recovery_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/", name="home")
@@ -184,6 +198,8 @@ async def health():
     }
 
 from app.main import (
+    _recover_jobs,
+    _run_job_recovery,
     cancel_video,
     create_video_job,
     delete_video,
@@ -206,5 +222,3 @@ app.add_api_route("/api/clips", list_clips, methods=["GET"])
 app.add_api_route("/api/clips/{clip_id}/video", stream_clip_video, methods=["GET"])
 app.add_api_route("/api/clips/{clip_id}/thumbnail", stream_clip_thumbnail, methods=["GET"])
 app.add_api_route("/api/clips/{clip_id}/source", stream_clip_source, methods=["GET"])
-
-

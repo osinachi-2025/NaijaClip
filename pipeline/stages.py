@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from models import CaptionStyle, Clip, ClipAspectRatio, ClipExport, ClipStatus, ExportStatus, Transcript, TranscriptSegment, TranscriptStatus
+from models import CaptionStyle, Clip, ClipAspectRatio, ClipExport, ClipStatus, ExportStatus, JobStatus, ProcessingJob, Transcript, TranscriptSegment, TranscriptStatus
 from core.config import (
     CAMERA_ACCELERATION,
     CAMERA_DEAD_ZONE,
@@ -31,6 +31,7 @@ from integrations.ffmpeg import FFmpeg
 from integrations.groq.client import GroqClient
 from integrations.storage import LocalStorage, R2Storage
 from integrations.yolo import YOLODetector
+from services.jobs import JobClaimLost
 from services.subtitles import (
     SUBTITLE_FORCE_STYLE,
     SUBTITLE_MAX_CHARS,
@@ -327,10 +328,11 @@ def _smooth_camera_trajectory(
 
 
 class PipelineStages:
-    def __init__(self, db, storage, ffmpeg: FFmpeg | None = None):
+    def __init__(self, db, storage, ffmpeg: FFmpeg | None = None, worker_id: str | None = None):
         self.db = db
         self.storage = storage
         self.ffmpeg = ffmpeg or FFmpeg()
+        self.worker_id = worker_id
         self._yolo_detector = None
 
     def handlers(self) -> dict[str, Any]:
@@ -418,7 +420,49 @@ class PipelineStages:
         if duration <= 0:
             raise ValueError("source video duration is invalid")
         boundary_segments = _deepgram_word_segments(context) or context.transcript_segments
-        result = GroqClient().evaluate_transcript(context.transcript, boundary_segments, duration)
+        stored_state = getattr(context.job, "groq_selection_state", None)
+        try:
+            decoded_state = json.loads(stored_state) if stored_state else {}
+            cached_chunks = decoded_state.get("chunks", {}) if decoded_state.get("version") == 1 else {}
+            if not isinstance(cached_chunks, dict):
+                cached_chunks = {}
+        except (TypeError, ValueError):
+            logger.warning("discarding malformed Groq chunk checkpoint job=%s", context.job.id)
+            cached_chunks = {}
+
+        def save_chunk_checkpoint(chunks: dict[str, list[dict]], completed: int, total: int) -> None:
+            if self.db is None:
+                return
+            payload = json.dumps({"version": 1, "chunks": chunks}, separators=(",", ":"))
+            query = self.db.query(ProcessingJob).filter(
+                ProcessingJob.id == context.job.id,
+                ProcessingJob.status == JobStatus.SELECTING,
+                ProcessingJob.cancelled_at.is_(None),
+            )
+            if self.worker_id is not None:
+                query = query.filter(ProcessingJob.worker_id == self.worker_id)
+            updated = query.update(
+                {
+                    ProcessingJob.groq_selection_state: payload,
+                    ProcessingJob.progress: min(49, 45 + int(4 * completed / max(1, total))),
+                },
+                synchronize_session=False,
+            )
+            if updated != 1:
+                self.db.rollback()
+                if self.worker_id is not None:
+                    raise JobClaimLost(f"processing job {context.job.id} is no longer owned by {self.worker_id}")
+                raise RuntimeError(f"processing job {context.job.id} is no longer selecting")
+            self.db.commit()
+            context.job.groq_selection_state = payload
+
+        result = GroqClient().evaluate_transcript(
+            context.transcript,
+            boundary_segments,
+            duration,
+            cached_chunks=cached_chunks,
+            on_chunk_complete=save_chunk_checkpoint,
+        )
         proposed_count = len(result.candidates)
         validated = validate_candidates(result.candidates, duration, minimum_duration, maximum_duration, boundary_segments)
         context.groq_candidates = remove_overlaps(validated)

@@ -167,16 +167,6 @@
   }
 
   if (page === 'reset') {
-    document.querySelectorAll('.nc-password-toggle').forEach((button) => {
-      button.addEventListener('click', () => {
-        const input = document.getElementById(button.dataset.passwordTarget);
-        const visible = input.type === 'text';
-        input.type = visible ? 'password' : 'text';
-        button.textContent = visible ? 'Show' : 'Hide';
-        button.setAttribute('aria-label', `${visible ? 'Show' : 'Hide'} ${input.id === 'new-password' ? 'new password' : 'confirmation password'}`);
-      });
-    });
-
     document.getElementById('reset-password-form')?.addEventListener('submit', async (event) => {
       event.preventDefault();
       const form = event.currentTarget;

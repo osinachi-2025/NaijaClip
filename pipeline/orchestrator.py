@@ -71,7 +71,12 @@ class PipelineOrchestrator:
             raise LookupError(f"processing job {job_id} not found")
         context = PipelineContext(job=job, video=job.video)
         if not self.stage_handlers:
-            self.stage_handlers = PipelineStages(self.db, self.storage, self.ffmpeg).handlers()
+            self.stage_handlers = PipelineStages(
+                self.db,
+                self.storage,
+                self.ffmpeg,
+                worker_id=self.worker_id,
+            ).handlers()
         stages = [
             ("ingestion", JobStatus.INGESTING, 5),
             ("input_validation", JobStatus.INGESTING, 10),
