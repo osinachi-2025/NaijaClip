@@ -23,7 +23,7 @@ from core.config import (
     CAMERA_RETURN_SPEED,
     CAMERA_SMOOTHING_ALPHA,
     MIN_TRACKING_COVERAGE,
-    MAX_CLIPS_PER_VIDEO,
+    GROQ_SELECTION_MIN_QUALITY_SCORE,
     TRACK_LOST_HOLD_FRAMES,
 )
 from integrations.deepgram import DeepgramClient
@@ -41,7 +41,7 @@ from services.subtitles import (
 )
 from .context import PipelineContext
 from .scoring import score_candidate
-from .validation import clip_duration_range, remove_overlaps, validate_candidates
+from .validation import ClipCandidate, clip_duration_range, remove_overlaps, validate_candidates
 
 
 logger = logging.getLogger(__name__)
@@ -51,15 +51,31 @@ def _deepgram_word_segments(context: PipelineContext) -> list[dict[str, Any]]:
     channels = raw.get("results", {}).get("channels", [])
     alternatives = channels[0].get("alternatives", []) if channels else []
     words = alternatives[0].get("words", []) if alternatives else []
-    return [
-        {
-            "start": word.get("start"),
-            "end": word.get("end"),
-            "text": word.get("punctuated_word") or word.get("word") or "",
-        }
-        for word in words
-        if word.get("start") is not None and word.get("end") is not None
-    ]
+    duration = float(getattr(context, "media_info", {}).get("format", {}).get("duration") or 0)
+    normalized = []
+    for word in words:
+        try:
+            start = float(word.get("start"))
+            end = float(word.get("end"))
+        except (TypeError, ValueError):
+            continue
+        text = " ".join(str(word.get("punctuated_word") or word.get("word") or "").split())
+        if (
+            not math.isfinite(start)
+            or not math.isfinite(end)
+            or start < 0
+            or end <= start
+            or (duration > 0 and end > duration)
+            or not text
+        ):
+            continue
+        normalized.append({
+            "start": round(start, 3),
+            "end": round(end, 3),
+            "text": text,
+            **({"speaker": word["speaker"]} if word.get("speaker") is not None else {}),
+        })
+    return normalized
 
 
 def _resolve_tracker_factory(cv2_module: Any) -> Any:
@@ -377,7 +393,7 @@ class PipelineStages:
         context.transcript = alternative.get("transcript", "").strip()
         utterances = result.get("utterances") or []
         context.transcript_segments = [
-            {"start": float(item.get("start", 0)), "end": float(item.get("end", 0)), "text": item.get("transcript", "").strip(), "confidence": item.get("confidence")}
+            {"start": item.get("start"), "end": item.get("end"), "text": item.get("transcript", "").strip(), "confidence": item.get("confidence"), "speaker": item.get("speaker")}
             for item in utterances if item.get("transcript")
         ]
         if not context.transcript_segments:
@@ -386,10 +402,23 @@ class PipelineStages:
                 for sentence in paragraph.get("sentences", []):
                     text = sentence.get("text", "").strip()
                     if text:
-                        context.transcript_segments.append({"start": float(sentence.get("start", 0)), "end": float(sentence.get("end", 0)), "text": text, "confidence": None})
+                        context.transcript_segments.append({"start": sentence.get("start"), "end": sentence.get("end"), "text": text, "confidence": None})
         if not context.transcript_segments and alternative.get("words"):
             words = alternative["words"]
-            context.transcript_segments = [{"start": float(word.get("start", 0)), "end": float(word.get("end", 0)), "text": word.get("punctuated_word", word.get("word", "")), "confidence": word.get("confidence")} for word in words]
+            context.transcript_segments = [{"start": word.get("start"), "end": word.get("end"), "text": word.get("punctuated_word", word.get("word", "")), "confidence": word.get("confidence"), "speaker": word.get("speaker")} for word in words]
+        normalized_segments = GroqClient._normalize_segments(
+            context.transcript_segments,
+            float(context.media_info.get("format", {}).get("duration") or 0) or None,
+        )
+        context.transcript_segments = [
+            {
+                "start": item["s"],
+                "end": item["e"],
+                "text": item["t"],
+                **({"speaker": item["speaker"]} if "speaker" in item else {}),
+            }
+            for item in normalized_segments
+        ]
         context._deepgram_raw = raw
         transcript_duration = max((segment["end"] for segment in context.transcript_segments), default=0.0)
         source_duration = float(context.media_info.get("format", {}).get("duration") or 0.0)
@@ -399,14 +428,21 @@ class PipelineStages:
         )
 
     def transcript_validation(self, context: PipelineContext) -> None:
-        if not context.transcript or not context.transcript_segments:
-            raise ValueError("Deepgram returned no timestamped transcript")
         existing = context.video.transcript
         if existing:
             self.db.delete(existing)
             self.db.flush()
         transcript = Transcript(video_id=context.video.id, provider="deepgram", status=TranscriptStatus.COMPLETED, full_text=context.transcript)
-        transcript.segments = [TranscriptSegment(start_seconds=item["start"], end_seconds=item["end"], text=item["text"], confidence=item.get("confidence")) for item in context.transcript_segments if item["end"] >= item["start"]]
+        transcript.segments = [
+            TranscriptSegment(
+                start_seconds=item["start"],
+                end_seconds=item["end"],
+                text=item["text"],
+                confidence=item.get("confidence"),
+                speaker=item.get("speaker"),
+            )
+            for item in context.transcript_segments
+        ]
         self.db.add(transcript)
         self.db.flush()
 
@@ -416,14 +452,14 @@ class PipelineStages:
         configured_minimum = float(os.getenv("MIN_CLIP_DURATION", str(default_minimum)))
         configured_maximum = float(os.getenv("MAX_CLIP_DURATION", str(default_maximum)))
         minimum_duration = max(default_minimum, configured_minimum)
-        maximum_duration = min(default_maximum, configured_maximum)
+        maximum_duration = max(minimum_duration, min(default_maximum, configured_maximum))
         if duration <= 0:
             raise ValueError("source video duration is invalid")
         boundary_segments = _deepgram_word_segments(context) or context.transcript_segments
         stored_state = getattr(context.job, "groq_selection_state", None)
         try:
             decoded_state = json.loads(stored_state) if stored_state else {}
-            cached_chunks = decoded_state.get("chunks", {}) if decoded_state.get("version") == 1 else {}
+            cached_chunks = decoded_state.get("chunks", {}) if decoded_state.get("version") == 2 else {}
             if not isinstance(cached_chunks, dict):
                 cached_chunks = {}
         except (TypeError, ValueError):
@@ -433,7 +469,7 @@ class PipelineStages:
         def save_chunk_checkpoint(chunks: dict[str, list[dict]], completed: int, total: int) -> None:
             if self.db is None:
                 return
-            payload = json.dumps({"version": 1, "chunks": chunks}, separators=(",", ":"))
+            payload = json.dumps({"version": 2, "chunks": chunks}, separators=(",", ":"))
             query = self.db.query(ProcessingJob).filter(
                 ProcessingJob.id == context.job.id,
                 ProcessingJob.status == JobStatus.SELECTING,
@@ -460,22 +496,63 @@ class PipelineStages:
             context.transcript,
             boundary_segments,
             duration,
+            job_id=context.job.id,
             cached_chunks=cached_chunks,
             on_chunk_complete=save_chunk_checkpoint,
         )
         proposed_count = len(result.candidates)
-        validated = validate_candidates(result.candidates, duration, minimum_duration, maximum_duration, boundary_segments)
+        eligible = []
+        semantic_rejections = 0
+        semantic_rejection_reasons: dict[str, int] = {}
+        for item in result.candidates:
+            metadata = item.semantic_metadata
+            reasons = []
+            if not metadata.is_complete_thought:
+                reasons.append("incomplete_thought")
+            if not metadata.has_enough_context:
+                reasons.append("insufficient_context")
+            if not (metadata.ends_on_sentence_boundary or metadata.natural_pause_detected):
+                reasons.append("unnatural_ending")
+            if reasons:
+                semantic_rejections += 1
+                for reason in reasons:
+                    semantic_rejection_reasons[reason] = semantic_rejection_reasons.get(reason, 0) + 1
+                continue
+            eligible.append(ClipCandidate(
+                start=item.start,
+                end=item.end,
+                reason=item.reason,
+                scores=item.scores,
+            ))
+        validated = validate_candidates(eligible, duration, minimum_duration, maximum_duration, boundary_segments)
         context.groq_candidates = remove_overlaps(validated)
         logger.info(
-            "[CLIP SELECTION] source_duration=%.2fs transcript_segments=%d proposed=%d rejected_validation=%d rejected_duplicate_overlap=%d survivors=%d",
-            duration, len(boundary_segments), proposed_count,
-            proposed_count - len(validated), len(validated) - len(context.groq_candidates),
+            "[CLIP SELECTION] job_id=%s source_duration=%.2fs transcript_duration=%.2fs transcript_segments=%d proposed=%d rejected_semantic=%d rejected_validation=%d rejected_duplicate_overlap=%d survivors=%d",
+            context.job.id,
+            duration,
+            max((segment["end"] for segment in boundary_segments), default=0.0),
+            len(boundary_segments),
+            proposed_count,
+            semantic_rejections,
+            len(eligible) - len(validated),
+            len(validated) - len(context.groq_candidates),
             len(context.groq_candidates),
         )
-        if not context.groq_candidates:
-            raise ValueError(f"Groq returned no valid clip candidates for a {duration:.2f}s source; target range was {minimum_duration:.2f}s to {maximum_duration:.2f}s")
+        logger.info(
+            "[CLIP SELECTION] job_id=%s semantic_rejection_reasons=%s",
+            context.job.id,
+            semantic_rejection_reasons,
+        )
 
     def candidate_scoring(self, context: PipelineContext) -> None:
+        if not context.groq_candidates:
+            context.scored_candidates = []
+            context.selected_clips = []
+            logger.info(
+                "[CLIP SELECTION] job_id=%s selected_for_render=0 reason=no_viable_candidates",
+                context.job.id,
+            )
+            return
         scored = []
         for item in context.groq_candidates:
             duration = item.duration
@@ -484,22 +561,35 @@ class PipelineStages:
             confidence_values = [segment["confidence"] for segment in overlap if segment.get("confidence") is not None]
             scored.append(score_candidate(item, speech_density=min(10.0, speech_seconds / duration * 10.0), boundary_quality=min(10.0, len(overlap) + 5.0), confidence=(sum(confidence_values) / len(confidence_values) * 10.0 if confidence_values else None)))
         ranked = sorted(scored, key=lambda item: item.final_score, reverse=True)
-        threshold = float(os.getenv("MIN_CLIP_SCORE", "5"))
+        threshold = GROQ_SELECTION_MIN_QUALITY_SCORE
         context.scored_candidates = [item for item in ranked if item.final_score >= threshold]
-        limit = min(12, MAX_CLIPS_PER_VIDEO)
-        context.selected_clips = context.scored_candidates[:limit]
-        if not context.selected_clips:
-            raise ValueError("no candidates met the minimum score")
+        context.selected_clips = context.scored_candidates
+        logger.info(
+            "[CLIP SELECTION] job_id=%s quality_threshold=%.2f eligible=%d rejected_below_quality=%d selected=%d",
+            context.job.id,
+            threshold,
+            len(ranked),
+            len(ranked) - len(context.selected_clips),
+            len(context.selected_clips),
+        )
         for rank, item in enumerate(context.selected_clips, 1):
             candidate = item.candidate.candidate
-            clip = Clip(video_id=context.video.id, title=candidate.reason[:500], description=candidate.reason, start_seconds=candidate.start, end_seconds=candidate.end, status=ClipStatus.SELECTED, ai_score=item.final_score, hook_score=candidate.scores.hook, standalone_score=candidate.scores.context_independence, engagement_score=candidate.scores.engagement_potential, rank=rank, aspect_ratio=ClipAspectRatio.PORTRAIT, caption_style=CaptionStyle.BASIC, caption_text=context.transcript)
-            self.db.add(clip)
+            clip = self.db.query(Clip).filter(
+                Clip.video_id == context.video.id,
+                Clip.start_seconds == round(candidate.start, 3),
+                Clip.end_seconds == round(candidate.end, 3),
+            ).first()
+            if clip is None:
+                clip = Clip(video_id=context.video.id, title=candidate.reason[:500], description=candidate.reason, start_seconds=candidate.start, end_seconds=candidate.end, status=ClipStatus.SELECTED, ai_score=item.final_score, hook_score=candidate.scores.hook, standalone_score=candidate.scores.context_independence, engagement_score=candidate.scores.engagement_potential, rank=rank, aspect_ratio=ClipAspectRatio.PORTRAIT, caption_style=CaptionStyle.BASIC, caption_text=context.transcript)
+                self.db.add(clip)
             item.clip = clip
             logger.info("[PIPELINE] LLM selected clip-%d: %s", rank, clip.title)
         self.db.flush()
         logger.info("[CLIP SELECTION] selected_for_render=%d", len(context.selected_clips))
 
     def clip_extraction(self, context: PipelineContext) -> None:
+        if not context.selected_clips:
+            return
         for index, item in enumerate(context.selected_clips, 1):
             logger.info("[PIPELINE] Extracting LLM-selected clip-%d", index)
             output = context.temp_dir / f"clip-{index}.mp4"
@@ -508,6 +598,9 @@ class PipelineStages:
             context.extracted_clips.append(output)
 
     def yolo_detection(self, context: PipelineContext) -> None:
+        if not context.selected_clips:
+            logger.info("[PIPELINE] Skipping YOLO because clip selection returned zero clips job_id=%s", context.job.id)
+            return
         try:
             import cv2
         except ImportError as error:
@@ -555,6 +648,9 @@ class PipelineStages:
                 logger.warning("[PIPELINE] No person detected in %s; tracking is unavailable and reframing will explicitly use center crop", clip_label)
 
     def opencv_tracking(self, context: PipelineContext) -> None:
+        if not context.selected_clips:
+            logger.info("[PIPELINE] Skipping OpenCV tracking because clip selection returned zero clips job_id=%s", context.job.id)
+            return
         try:
             import cv2
         except ImportError as error:
@@ -714,6 +810,8 @@ class PipelineStages:
                 capture.release()
 
     def reframing(self, context: PipelineContext) -> None:
+        if not context.selected_clips:
+            return
         video_stream = next((stream for stream in context.media_info.get("streams", []) if stream.get("codec_type") == "video"), {})
         probed_width = int(video_stream.get("width") or context.video.width or 0)
         probed_height = int(video_stream.get("height") or context.video.height or 0)

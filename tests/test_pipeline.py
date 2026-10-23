@@ -21,7 +21,7 @@ from pipeline.stages import (
     _simplify_camera_points,
     _smooth_camera_trajectory,
 )
-from pipeline.validation import CandidateScores, ClipCandidate, clip_duration_range, remove_overlaps, validate_candidates
+from pipeline.validation import CandidateScores, ClipCandidate, GroqCandidates, clip_duration_range, remove_overlaps, validate_candidates
 
 
 def scores(value=8):
@@ -32,9 +32,10 @@ def scores(value=8):
     )})
 
 
-def groq_candidate_json(start, end):
+def groq_candidate_json(start, end, window_id="w000001"):
     return json.dumps({
         "candidates": [{
+            "window_id": window_id,
             "start": start,
             "end": end,
             "reason": "A complete moment",
@@ -52,6 +53,30 @@ def groq_candidate_json(start, end):
             },
         }],
     })
+
+
+def groq_windows_json(windows):
+    candidates = []
+    for window in windows:
+        candidates.append({
+            "window_id": window["id"],
+            "start": window["segments"][0]["s"],
+            "end": window["segments"][-1]["e"],
+            "reason": "A complete moment",
+            "scores": {field: 8 for field in (
+                "hook", "value", "emotional_impact", "clarity", "story_completeness",
+                "quotability", "engagement_potential", "payoff", "context_independence",
+                "clip_efficiency",
+            )},
+            "semantic_metadata": {
+                "is_complete_thought": True,
+                "ends_on_sentence_boundary": True,
+                "contains_conclusion_or_answer": False,
+                "has_enough_context": True,
+                "natural_pause_detected": True,
+            },
+        })
+    return json.dumps({"candidates": candidates})
 
 
 def test_invalid_timestamps_are_rejected():
@@ -193,97 +218,254 @@ def test_clip_duration_scales_with_video_runtime():
     assert long_min >= 20
 
 
-def test_candidate_generation_chunks_the_full_long_transcript_and_aggregates():
+def test_small_video_returns_candidate_on_original_timestamps():
     calls = []
 
     class FakeCompletions:
         def create(self, **kwargs):
             payload = json.loads(kwargs["messages"][1]["content"])
-            calls.append((kwargs["messages"][0]["content"], payload))
-            start = payload["timestamped_segments"][0]["s"]
-            end = payload["timestamped_segments"][0]["e"]
-            content = groq_candidate_json(start, end)
+            calls.append(kwargs)
+            content = groq_windows_json(payload["windows"])
             return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
 
     client = GroqClient.__new__(GroqClient)
     client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     client.model = "test-model"
-    segments = [
-        {"start": minute * 600, "end": minute * 600 + 10, "text": f"topic {minute}"}
-        for minute in range(4)
-    ]
+    segments = [{"start": 12, "end": 24, "text": "A complete explanation with a useful ending."}]
 
-    result = client.evaluate_transcript("", segments, 2400)
+    result = client.evaluate_transcript("Original transcript remains available.", segments, 30)
 
-    assert len(calls) == 4
-    assert [call[1]["timestamped_segments"][0]["s"] for call in calls] == [0, 600, 1200, 1800]
-    assert all("no more than 2 self-contained, distinct clips" in call[0] for call in calls)
-    assert len(result.candidates) == 4
-
-    calls.clear()
-    client.evaluate_transcript("", [{"start": 0, "end": 2400, "text": "A long complete transcript window."}], 2400)
     assert len(calls) == 1
-    assert "no more than 8 self-contained, distinct clips" in calls[0][0]
-    assert calls[0][0].count("Select no more than") == 1
+    assert len(result.candidates) == 1
+    assert (result.candidates[0].start, result.candidates[0].end) == (12, 24)
 
 
-def test_token_aware_chunks_prefer_sentence_boundaries_and_keep_timestamped_context(monkeypatch):
-    monkeypatch.setattr("integrations.groq.client.GROQ_MAX_INPUT_TOKENS", 500)
-    segments = [
-        {"start": 0, "end": 10, "text": "alpha " * 115 + "end."},
-        {"start": 10, "end": 20, "text": "beta " * 115 + "end."},
-        {"start": 20, "end": 30, "text": "gamma " * 115 + "end."},
-    ]
-
-    chunks = GroqClient._chunk_segments(segments)
-
-    assert len(chunks) == 2
-    assert chunks[0][-1] == chunks[1][0]
-    assert chunks[0][-1]["s"] == 10
-    assert all(
-        GroqClient._estimate_tokens(json.dumps(chunk, separators=(",", ":"), ensure_ascii=False)) <= 500
-        for chunk in chunks
-    )
-    assert all(item["s"] in {0, 10, 20} and item["e"] == item["s"] + 10 for chunk in chunks for item in chunk)
-
-
-def test_successful_chunks_are_reused_after_a_later_chunk_fails(monkeypatch):
-    chunks = [[{"s": 0, "e": 10, "t": "First sentence."}], [{"s": 10, "e": 20, "t": "Second sentence."}]]
-    monkeypatch.setattr(GroqClient, "_chunk_segments", staticmethod(lambda _segments: chunks))
+def test_long_transcript_is_split_into_token_bounded_batches():
     calls = []
 
     class FakeCompletions:
         def create(self, **kwargs):
             payload = json.loads(kwargs["messages"][1]["content"])
-            start = payload["timestamped_segments"][0]["s"]
-            calls.append(start)
-            if start == 10 and calls.count(10) == 1:
-                raise ConnectionError("temporary network issue")
-            end = payload["timestamped_segments"][-1]["e"]
+            calls.append(kwargs)
             return SimpleNamespace(choices=[SimpleNamespace(
-                message=SimpleNamespace(content=groq_candidate_json(start, end))
+                message=SimpleNamespace(content=groq_windows_json(payload["windows"]))
+            )])
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+    segments = [
+        {"start": index * 5, "end": index * 5 + 4, "text": f"Complete sentence number {index}."}
+        for index in range(240)
+    ]
+
+    result = client.evaluate_transcript("", segments, 1200)
+
+    assert len(calls) > 1
+    assert result.candidates
+    for call in calls:
+        payload = json.loads(call["messages"][1]["content"])
+        assert len(payload["windows"]) <= 4
+        assert client._request_token_estimate(
+            call["messages"],
+            call["response_format"],
+            call["max_tokens"],
+        ) <= 5000
+
+
+def test_oversized_transcript_windows_split_on_sentence_boundaries(monkeypatch):
+    monkeypatch.setattr("integrations.groq.client.GROQ_SELECTION_MAX_INPUT_TOKENS", 2200)
+    monkeypatch.setattr("integrations.groq.client.GROQ_SELECTION_MAX_OUTPUT_TOKENS", 256)
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            payload = json.loads(kwargs["messages"][1]["content"])
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=groq_windows_json(payload["windows"]))
+            )])
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+    segments = [
+        {"start": index * 20, "end": (index + 1) * 20, "text": f"Sentence {index} " + "word " * 180 + "."}
+        for index in range(6)
+    ]
+
+    result = client.evaluate_transcript("", segments, 1800)
+
+    assert len(calls) > 1
+    assert result.candidates
+    assert all(
+        client._request_token_estimate(
+            call["messages"],
+            call["response_format"],
+            call["max_tokens"],
+        ) <= 2200
+        for call in calls
+    )
+    assert any(".a" in json.loads(call["messages"][1]["content"])["windows"][0]["id"] for call in calls)
+
+
+def test_overlapping_candidate_windows_keep_original_timestamps_and_speakers():
+    segments = [
+        {"start": index * 4, "end": index * 4 + 3, "text": f"Speaker sentence {index}.", "speaker": index % 2}
+        for index in range(10)
+    ]
+    windows = GroqClient._candidate_windows(segments, 60)
+
+    assert len(windows) > 1
+    assert any(
+        left["end"] > right["start"]
+        for left, right in zip(windows, windows[1:])
+    )
+    assert all(segment["speaker"] in {"0", "1"} for window in windows for segment in window["segments"])
+    assert all(
+        segment["s"] in {item["start"] for item in segments}
+        and segment["e"] in {item["end"] for item in segments}
+        for window in windows
+        for segment in window["segments"]
+    )
+
+
+def test_completed_batches_are_reused_after_a_later_batch_failure(monkeypatch):
+    monkeypatch.setattr("integrations.groq.client.GROQ_SELECTION_BATCH_SIZE", 2)
+    monkeypatch.setattr("integrations.groq.client.GROQ_SELECTION_MAX_DURATION_SECONDS", 15)
+    monkeypatch.setattr("integrations.groq.client.MAX_SELECTION_ATTEMPTS", 1)
+    calls = []
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            payload = json.loads(kwargs["messages"][1]["content"])
+            window = payload["windows"][0]
+            calls.append(window["id"])
+            if window["start"] == 20 and calls.count(window["id"]) == 1:
+                raise ConnectionError("temporary network issue")
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=groq_windows_json(payload["windows"]))
             )])
 
     client = GroqClient.__new__(GroqClient)
     client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     client.model = "test-model"
     checkpoints = []
-
+    segments = [
+        {"start": 0, "end": 10, "text": "First complete thought."},
+        {"start": 10, "end": 20, "text": "Second complete thought."},
+        {"start": 20, "end": 30, "text": "Third complete thought."},
+        {"start": 30, "end": 40, "text": "Fourth complete thought."},
+    ]
     with pytest.raises(ConnectionError):
         client.evaluate_transcript(
             "",
-            [],
-            20,
+            segments,
+            60,
             on_chunk_complete=lambda state, completed, total: checkpoints.append((state, completed, total)),
         )
 
-    assert calls == [0, 10]
+    assert calls == ["w000001", "w000003"]
     assert len(checkpoints) == 1
-    saved_chunks = checkpoints[0][0]
-    result = client.evaluate_transcript("", [], 20, cached_chunks=saved_chunks)
+    result = client.evaluate_transcript("", segments, 60, cached_chunks=checkpoints[0][0])
+    assert calls == ["w000001", "w000003", "w000003"]
+    assert len(result.candidates) == 3
 
-    assert calls == [0, 10, 10]
-    assert [candidate.start for candidate in result.candidates] == [0, 10]
+
+def test_empty_transcript_and_empty_model_result_are_valid():
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+        create=lambda **_kwargs: SimpleNamespace(choices=[SimpleNamespace(
+            message=SimpleNamespace(content='{"candidates": []}')
+        )])
+    )))
+    client.model = "test-model"
+
+    assert client.evaluate_transcript("", [], 20).candidates == []
+    assert client.evaluate_transcript(
+        "",
+        [{"start": None, "end": 3, "text": "No reliable timestamps."}],
+        20,
+    ).candidates == []
+
+
+def test_groq_scores_reject_non_finite_and_out_of_range_values():
+    invalid = groq_candidate_json(0, 10).replace('"hook": 8', '"hook": 11')
+    with pytest.raises(ValueError):
+        GroqCandidates.model_validate_json(invalid)
+
+    invalid_nan = groq_candidate_json(0, 10).replace('"hook": 8', '"hook": NaN')
+    with pytest.raises(ValueError):
+        GroqCandidates.model_validate_json(invalid_nan)
+
+
+def test_zero_viable_candidates_skip_expensive_visual_stages(tmp_path):
+    audio_path = tmp_path / "source-audio.wav"
+    audio_path.write_bytes(b"source audio")
+
+    class FakeDatabase:
+        def commit(self):
+            pass
+
+    context = PipelineContext(
+        job=SimpleNamespace(id="zero-clips"),
+        video=SimpleNamespace(id="video-zero", user_id="user-zero"),
+        audio_path=audio_path,
+        temp_dir=tmp_path,
+    )
+    stages = PipelineStages(db=FakeDatabase(), storage=None, ffmpeg=SimpleNamespace())
+    stages.candidate_scoring(context)
+    stages.clip_extraction(context)
+    stages.yolo_detection(context)
+    stages.opencv_tracking(context)
+    stages.reframing(context)
+    stages.captions(context)
+    stages.audio_processing(context)
+    stages.ffmpeg_rendering(context)
+    stages.output_validation(context)
+    stages.thumbnail_generation(context)
+    stages.export(context)
+
+    assert context.selected_clips == []
+    assert context.final_exports == []
+    assert context.rendered_outputs == []
+
+
+def test_oversized_batch_is_split_without_losing_candidates(monkeypatch):
+    monkeypatch.setattr("integrations.groq.client.GROQ_SELECTION_BATCH_SIZE", 2)
+    monkeypatch.setattr("integrations.groq.client.GROQ_SELECTION_MAX_DURATION_SECONDS", 15)
+    calls = []
+
+    class ProviderError(Exception):
+        status_code = 413
+
+    class FakeCompletions:
+        def create(self, **kwargs):
+            payload = json.loads(kwargs["messages"][1]["content"])
+            windows = payload["windows"]
+            calls.append(len(windows))
+            if len(windows) > 1:
+                raise ProviderError()
+            return SimpleNamespace(choices=[SimpleNamespace(
+                message=SimpleNamespace(content=groq_windows_json(windows))
+            )])
+
+    client = GroqClient.__new__(GroqClient)
+    client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
+    client.model = "test-model"
+    result = client.evaluate_transcript(
+        "",
+        [
+            {"start": 0, "end": 10, "text": "First complete thought."},
+            {"start": 10, "end": 20, "text": "Second complete thought."},
+            {"start": 20, "end": 30, "text": "Third complete thought."},
+            {"start": 30, "end": 40, "text": "Fourth complete thought."},
+        ],
+        60,
+    )
+
+    assert calls == [2, 1, 1, 1]
+    assert len(result.candidates) == 3
 
 
 @pytest.mark.parametrize(
@@ -441,25 +623,9 @@ def test_gpt_oss_uses_strict_schema_and_recovers_json_validation_failure(caplog)
     assert len(calls) == 2
     assert calls[0]["response_format"]["type"] == "json_schema"
     assert calls[0]["response_format"]["json_schema"]["strict"] is True
-    assert calls[0]["max_tokens"] == 5400
     assert calls[1]["response_format"] == {"type": "json_object"}
-    assert calls[1]["max_tokens"] == 3600
-    system_prompt = calls[0]["messages"][0]["content"]
-    assert "no more than 8 self-contained, distinct clips" in system_prompt
-    example_json = system_prompt.split("Use this exact shape: ", 1)[1].split(". Every score", 1)[0]
-    example = json.loads(example_json)
-    assert len(example["candidates"][0]["scores"]) == 10
-    assert len(example["candidates"][0]["semantic_metadata"]) == 5
-    assert "at most 4 distinct" in calls[1]["messages"][0]["content"]
     assert all(call["messages"][1]["content"].find("A private transcript phrase.") >= 0 for call in calls)
-    assert "serialized_input_bytes" in caplog.text
-    assert "estimated_input_tokens" in caplog.text
-    assert "candidate_count" in caplog.text
-    assert "output_token_budget" in caplog.text
-    assert "http_status': 400" in caplog.text
-    assert "json_validate_failed" in caplog.text
-    assert "Invalid schema near [redacted]" in caplog.text
-    assert "provider_param" in caplog.text
+    assert "estimated_tokens=" in caplog.text
     assert "A private transcript phrase." not in caplog.text
 
 
@@ -481,8 +647,7 @@ def test_malformed_groq_response_is_retried_once_with_smaller_candidate_count():
     assert len(result.candidates) == 1
     assert len(calls) == 2
     assert calls[0]["response_format"] == {"type": "json_object"}
-    assert "no more than 8 self-contained, distinct clips" in calls[0]["messages"][0]["content"]
-    assert "at most 4 distinct" in calls[1]["messages"][0]["content"]
+    assert "zero or one strongest genuinely viable" in calls[0]["messages"][0]["content"]
 
 
 def test_ungrounded_groq_timestamps_are_rejected_and_retried_with_grounding():
@@ -507,7 +672,7 @@ def test_ungrounded_groq_timestamps_are_rejected_and_retried_with_grounding():
     assert len(calls) == 2
 
 
-def test_exhausted_json_validation_recovery_fails_with_safe_diagnostics():
+def test_exhausted_structured_schema_fallback_fails_safely():
     class JsonValidationError(Exception):
         status_code = 400
         body = {"error": {"code": "json_validate_failed"}}
@@ -523,7 +688,7 @@ def test_exhausted_json_validation_recovery_fails_with_safe_diagnostics():
     client.client = SimpleNamespace(chat=SimpleNamespace(completions=FakeCompletions()))
     client.model = "openai/gpt-oss-120b"
 
-    with pytest.raises(GroqOutputError, match="json_validate_failed"):
+    with pytest.raises(GroqOutputError, match="structured selection response format"):
         client.evaluate_transcript(
             "",
             [{"start": 0, "end": 10, "text": "Do not include transcript text in diagnostics."}],
@@ -565,9 +730,23 @@ def test_groq_payload_and_rate_limit_errors_do_not_use_json_recovery(status_code
 
 
 def test_long_video_candidate_target_and_selection_cap_are_bounded():
-    assert GroqClient._candidate_target(2400) == 8
-    assert GroqClient._candidate_target(60) == 3
-    assert GroqClient._candidate_target(60 * 60 * 24) <= 12
+    segments = [
+        {"start": index * 30, "end": index * 30 + 25, "text": f"Complete thought number {index}."}
+        for index in range(100)
+    ]
+    windows = GroqClient._candidate_windows(segments, 60 * 60 * 24)
+    assert len(windows) > 12
+
+
+def test_candidate_windows_avoid_thousands_of_pause_split_regions():
+    segments = [
+        {"start": index * 4, "end": index * 4 + 2, "text": f"Complete statement {index}."}
+        for index in range(1000)
+    ]
+
+    windows = GroqClient._candidate_windows(segments, 60 * 60)
+
+    assert 1 < len(windows) < 250
 
 
 def test_export_does_not_mark_clip_ready_if_thumbnail_persistence_fails(tmp_path):

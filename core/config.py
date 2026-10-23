@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,7 +14,10 @@ def _get_int(name: str, default: int, *, minimum: int | None = None) -> int:
         value = default
     else:
         try:
-            value = int(float(raw))
+            parsed = float(raw)
+            if not math.isfinite(parsed):
+                raise ValueError
+            value = int(parsed)
         except ValueError:
             value = default
     if minimum is not None and value < minimum:
@@ -30,6 +34,8 @@ def _get_float(name: str, default: float, *, minimum: float | None = None) -> fl
             value = float(raw)
         except ValueError:
             value = default
+    if not math.isfinite(value):
+        value = default
     if minimum is not None and value < minimum:
         value = minimum
     return value
@@ -62,6 +68,38 @@ JOB_RECOVERY_GRACE_SECONDS = _get_int("JOB_RECOVERY_GRACE_SECONDS", 120, minimum
 TRANSCRIPTION_TIMEOUT_SECONDS = _get_int("TRANSCRIPTION_TIMEOUT_SECONDS", 600, minimum=30)
 LLM_TIMEOUT_SECONDS = _get_int("LLM_TIMEOUT_SECONDS", 180, minimum=30)
 GROQ_MAX_INPUT_TOKENS = _get_int("GROQ_MAX_INPUT_TOKENS", 5000, minimum=500)
+GROQ_SELECTION_MODEL = os.getenv("GROQ_SELECTION_MODEL") or os.getenv("GROQ_MODEL", "gpt-oss-120b")
+GROQ_SELECTION_MAX_INPUT_TOKENS = _get_int(
+    "GROQ_SELECTION_MAX_INPUT_TOKENS",
+    GROQ_MAX_INPUT_TOKENS,
+    minimum=512,
+)
+GROQ_SELECTION_MAX_OUTPUT_TOKENS = _get_int("GROQ_SELECTION_MAX_OUTPUT_TOKENS", 1800, minimum=256)
+GROQ_SELECTION_CHUNK_OVERLAP_SECONDS = _get_float(
+    "GROQ_SELECTION_CHUNK_OVERLAP_SECONDS",
+    8.0,
+    minimum=0.0,
+)
+GROQ_SELECTION_BATCH_SIZE = _get_int("GROQ_SELECTION_BATCH_SIZE", 4, minimum=1)
+GROQ_SELECTION_MIN_DURATION_SECONDS = _get_float(
+    "GROQ_SELECTION_MIN_DURATION_SECONDS",
+    6.0,
+    minimum=0.0,
+)
+GROQ_SELECTION_MAX_DURATION_SECONDS = _get_float(
+    "GROQ_SELECTION_MAX_DURATION_SECONDS",
+    MAX_CLIP_DURATION_SECONDS,
+    minimum=1.0,
+)
+GROQ_SELECTION_MIN_QUALITY_SCORE = min(
+    10.0,
+    _get_float(
+        "GROQ_SELECTION_MIN_QUALITY_SCORE",
+        _get_float("MIN_CLIP_SCORE", 5.0, minimum=0.0),
+        minimum=0.0,
+    ),
+)
+GROQ_SELECTION_MAX_RETRIES = _get_int("GROQ_SELECTION_MAX_RETRIES", 2, minimum=0)
 GROQ_RATE_LIMIT_REQUESTS_PER_MINUTE = _get_int("GROQ_RATE_LIMIT_REQUESTS_PER_MINUTE", 30, minimum=1)
 GROQ_RATE_LIMIT_TOKENS_PER_MINUTE = _get_int("GROQ_RATE_LIMIT_TOKENS_PER_MINUTE", 12000, minimum=1)
 GROQ_RATE_LIMIT_REDIS_URL = os.getenv("GROQ_RATE_LIMIT_REDIS_URL") or CELERY_BROKER_URL

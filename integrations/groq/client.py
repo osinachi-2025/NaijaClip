@@ -5,23 +5,32 @@ import json
 import logging
 import math
 import os
+import random
 import re
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Callable
 
-from core.config import GROQ_MAX_INPUT_TOKENS, MAX_CLIPS_PER_VIDEO
-from pipeline.validation import GroqCandidateOutput, GroqCandidates
+from core.config import (
+    GROQ_429_FALLBACK_SECONDS,
+    LLM_TIMEOUT_SECONDS,
+    GROQ_SELECTION_BATCH_SIZE,
+    GROQ_SELECTION_CHUNK_OVERLAP_SECONDS,
+    GROQ_SELECTION_MAX_INPUT_TOKENS,
+    GROQ_SELECTION_MAX_OUTPUT_TOKENS,
+    GROQ_SELECTION_MAX_RETRIES,
+    GROQ_SELECTION_MIN_DURATION_SECONDS,
+    GROQ_SELECTION_MAX_DURATION_SECONDS,
+    GROQ_SELECTION_MODEL,
+)
+from pipeline.validation import GroqCandidateOutput, GroqCandidates, clip_duration_range
 from .rate_limit import GroqRateLimiter
 
 logger = logging.getLogger(__name__)
 
-MAX_PROMPT_CHARS = 14000
-MAX_TRANSCRIPT_CHUNKS = 64
-MAX_CANDIDATE_TARGET = 12
-MAX_CANDIDATES_PER_CHUNK = MAX_CANDIDATE_TARGET
-MAX_JSON_GENERATION_ATTEMPTS = 2
-CHUNK_CHECKPOINT_VERSION = 1
+MAX_SELECTION_ATTEMPTS = GROQ_SELECTION_MAX_RETRIES + 1
+CHECKPOINT_VERSION = 2
 
 GROQ_CANDIDATE_JSON_SCHEMA = {
     "type": "object",
@@ -31,6 +40,7 @@ GROQ_CANDIDATE_JSON_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
+                    "window_id": {"type": "string"},
                     "start": {"type": "number"},
                     "end": {"type": "number"},
                     "reason": {"type": "string"},
@@ -49,16 +59,9 @@ GROQ_CANDIDATE_JSON_SCHEMA = {
                             "clip_efficiency": {"type": "number"},
                         },
                         "required": [
-                            "hook",
-                            "value",
-                            "emotional_impact",
-                            "clarity",
-                            "story_completeness",
-                            "quotability",
-                            "engagement_potential",
-                            "payoff",
-                            "context_independence",
-                            "clip_efficiency",
+                            "hook", "value", "emotional_impact", "clarity",
+                            "story_completeness", "quotability", "engagement_potential",
+                            "payoff", "context_independence", "clip_efficiency",
                         ],
                         "additionalProperties": False,
                     },
@@ -72,16 +75,14 @@ GROQ_CANDIDATE_JSON_SCHEMA = {
                             "natural_pause_detected": {"type": "boolean"},
                         },
                         "required": [
-                            "is_complete_thought",
-                            "ends_on_sentence_boundary",
-                            "contains_conclusion_or_answer",
-                            "has_enough_context",
+                            "is_complete_thought", "ends_on_sentence_boundary",
+                            "contains_conclusion_or_answer", "has_enough_context",
                             "natural_pause_detected",
                         ],
                         "additionalProperties": False,
                     },
                 },
-                "required": ["start", "end", "reason", "scores", "semantic_metadata"],
+                "required": ["window_id", "start", "end", "reason", "scores", "semantic_metadata"],
                 "additionalProperties": False,
             },
         },
@@ -92,7 +93,7 @@ GROQ_CANDIDATE_JSON_SCHEMA = {
 
 
 class GroqOutputError(ValueError):
-    """A bounded Groq response-generation failure with transcript-free diagnostics."""
+    """A bounded, non-retryable structured-output failure."""
 
 
 class GroqRateLimitError(RuntimeError):
@@ -101,8 +102,7 @@ class GroqRateLimitError(RuntimeError):
         self.retry_after_seconds = max(0.001, retry_after_seconds)
         self.details = details or {}
         super().__init__(
-            "Groq rate limit exceeded (HTTP 429; "
-            f"retry after {self.retry_after_seconds:.3f}s; {self.details})"
+            f"Groq rate limit exceeded (HTTP 429; retry after {self.retry_after_seconds:.3f}s)"
         )
 
 
@@ -111,178 +111,188 @@ class GroqClient:
         from groq import Groq
 
         self._api_key = api_key or os.getenv("GROQ_API_KEY")
-        self.client = Groq(api_key=self._api_key)
-        self.model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        self.client = Groq(api_key=self._api_key, timeout=LLM_TIMEOUT_SECONDS)
+        self.model = model or GROQ_SELECTION_MODEL
         self.rate_limiter = GroqRateLimiter(model=self.model)
 
     @staticmethod
     def _estimate_tokens(value: str) -> int:
-        return max(1, math.ceil(len(value.encode("utf-8")) / 3))
+        return max(1, math.ceil(len(value.encode("utf-8")) / 2))
+
+    @staticmethod
+    def _normalize_segments(
+        segments: list[dict],
+        source_duration: float | None = None,
+    ) -> list[dict]:
+        normalized = []
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            try:
+                start = float(segment.get("start", segment.get("s")))
+                end = float(segment.get("end", segment.get("e")))
+            except (TypeError, ValueError):
+                continue
+            text = " ".join(str(segment.get("text", segment.get("t", ""))).split())
+            if (
+                not math.isfinite(start)
+                or not math.isfinite(end)
+                or start < 0
+                or end <= start
+                or (source_duration is not None and end > source_duration)
+                or not text
+            ):
+                continue
+            item = {"s": round(start, 3), "e": round(end, 3), "t": text}
+            speaker = segment.get("speaker", segment.get("speaker_id"))
+            if speaker is not None:
+                item["speaker"] = str(speaker)[:100]
+            normalized.append(item)
+        normalized.sort(key=lambda item: (item["s"], item["e"]))
+        return normalized
 
     @staticmethod
     def _sentence_groups(segments: list[dict], max_duration: float = 600.0) -> list[list[dict]]:
         groups: list[list[dict]] = []
         current: list[dict] = []
-        for segment in segments:
-            text = " ".join(str(segment.get("text", segment.get("t", ""))).split())
-            if not text:
-                continue
-            item = {
-                "s": round(float(segment.get("start", segment.get("s", 0))), 2),
-                "e": round(float(segment.get("end", segment.get("e", 0))), 2),
-                "t": text,
-            }
-            if current and item["e"] - current[0]["s"] > max_duration:
+        for item in GroqClient._normalize_segments(segments):
+            previous = current[-1] if current else None
+            pause = item["s"] - previous["e"] if previous else 0.0
+            changed_speaker = bool(
+                previous
+                and previous.get("speaker") is not None
+                and item.get("speaker") is not None
+                and previous["speaker"] != item["speaker"]
+            )
+            if current and (
+                item["e"] - current[0]["s"] > max_duration
+                or pause >= 1.5
+                or changed_speaker
+            ):
                 groups.append(current)
                 current = []
             current.append(item)
-            if text.rstrip("\"')]}").endswith((".", "!", "?")):
+            if item["t"].rstrip("\"')]}”’").endswith((".", "!", "?", "…")):
                 groups.append(current)
                 current = []
         if current:
             groups.append(current)
         return groups
 
-    @staticmethod
-    def _chunk_segments(
-        segments: list[dict],
-        limit: int = MAX_PROMPT_CHARS,
-        max_duration: float = 600.0,
-    ) -> list[list[dict]]:
-        token_budget = min(GROQ_MAX_INPUT_TOKENS, max(500, limit // 3 - 400))
-        chunks: list[list[dict]] = []
-        current: list[dict] = []
-        used_tokens = 0
-        previous_sentence: list[dict] = []
+    @classmethod
+    def _candidate_windows(cls, segments: list[dict], source_duration: float) -> list[dict]:
+        normalized = cls._normalize_segments(segments, source_duration)
+        if not normalized or source_duration <= 0:
+            return []
 
-        def estimated_group_tokens(group: list[dict]) -> int:
-            encoded = json.dumps(group, separators=(",", ":"), ensure_ascii=False)
-            return GroqClient._estimate_tokens(encoded)
+        default_minimum, _ = clip_duration_range(source_duration)
+        minimum = min(
+            source_duration,
+            max(GROQ_SELECTION_MIN_DURATION_SECONDS, min(default_minimum, source_duration)),
+        )
+        maximum = min(source_duration, max(minimum, GROQ_SELECTION_MAX_DURATION_SECONDS))
+        _, default_maximum = clip_duration_range(source_duration)
+        window_target = min(maximum, max(minimum, min(45.0, default_maximum)))
+        sentences = cls._sentence_groups(normalized, max_duration=maximum)
+        windows = []
+        index = 0
+        while index < len(sentences):
+            end_index = index
+            start_time = sentences[index][0]["s"]
+            while end_index + 1 < len(sentences):
+                current_end = sentences[end_index][-1]["e"]
+                next_sentence = sentences[end_index + 1]
+                gap = next_sentence[0]["s"] - current_end
+                if current_end - start_time >= minimum and gap >= 1.5:
+                    break
+                if current_end - start_time >= window_target:
+                    break
+                next_end = sentences[end_index + 1][-1]["e"]
+                if next_end - start_time > maximum and end_index > index:
+                    break
+                end_index += 1
+                if next_end - start_time >= window_target:
+                    break
 
-        for sentence in GroqClient._sentence_groups(segments, max_duration):
-            sentence_tokens = estimated_group_tokens(sentence)
-            if sentence_tokens > token_budget:
-                if current:
-                    chunks.append(current)
-                    previous_sentence = GroqClient._sentence_groups(current)[-1]
-                    current = []
-                    used_tokens = 0
-                for item in sentence:
-                    item_tokens = estimated_group_tokens([item])
-                    if item_tokens > token_budget or len(json.dumps(item, ensure_ascii=False)) > limit:
-                        raise ValueError("a timestamped transcript segment exceeds the prompt size limit")
-                    elapsed = item["e"] - current[0]["s"] if current else 0
-                    if current and (used_tokens + item_tokens > token_budget or elapsed > max_duration):
-                        chunks.append(current)
-                        previous_sentence = current[-1:]
-                        current = []
-                        used_tokens = 0
-                    if not current and previous_sentence:
-                        context_tokens = estimated_group_tokens(previous_sentence)
-                        context_duration = item["e"] - previous_sentence[0]["s"]
-                        if context_tokens + item_tokens <= token_budget and context_duration <= max_duration:
-                            current = list(previous_sentence)
-                            used_tokens = context_tokens
-                        previous_sentence = []
-                    current.append(item)
-                    used_tokens += item_tokens
-                continue
+            selected = [
+                segment
+                for sentence in sentences[index : end_index + 1]
+                for segment in sentence
+            ]
+            if selected:
+                window_start = selected[0]["s"]
+                window_end = selected[-1]["e"]
+                identity = f"{window_start:.3f}:{window_end:.3f}"
+                windows.append({
+                    "id": f"w{len(windows) + 1:06d}",
+                    "identity": identity,
+                    "start": window_start,
+                    "end": window_end,
+                    "segments": selected,
+                })
 
-            elapsed = sentence[-1]["e"] - current[0]["s"] if current else 0
-            if current and (used_tokens + sentence_tokens > token_budget or elapsed > max_duration):
-                chunks.append(current)
-                previous_sentence = GroqClient._sentence_groups(current)[-1]
-                current = []
-                used_tokens = 0
+            if end_index >= len(sentences) - 1:
+                break
+            window_duration = max(0.0, sentences[end_index][-1]["e"] - start_time)
+            overlap = min(GROQ_SELECTION_CHUNK_OVERLAP_SECONDS, window_duration * 0.25)
+            next_start = sentences[end_index][-1]["e"] - overlap
+            next_index = next(
+                (candidate for candidate in range(index + 1, end_index + 1)
+                 if sentences[candidate][-1]["e"] > next_start),
+                end_index + 1,
+            )
+            index = max(index + 1, next_index)
 
-            if not current and previous_sentence:
-                context_tokens = estimated_group_tokens(previous_sentence)
-                if context_tokens + sentence_tokens <= token_budget:
-                    context_duration = sentence[-1]["e"] - previous_sentence[0]["s"]
-                    if context_duration <= max_duration:
-                        current = list(previous_sentence)
-                        used_tokens = context_tokens
-                previous_sentence = []
-
-            current.extend(sentence)
-            used_tokens += sentence_tokens
-        if current:
-            chunks.append(current)
-        if len(chunks) > MAX_TRANSCRIPT_CHUNKS:
-            raise ValueError("transcript exceeds the bounded clip-selection window count")
-        return chunks
+        unique = []
+        seen = set()
+        for window in windows:
+            if window["identity"] not in seen:
+                seen.add(window["identity"])
+                unique.append(window)
+        return unique
 
     @staticmethod
     def _header(headers, name: str) -> str | None:
-        if headers is None:
+        if headers is None or not hasattr(headers, "items"):
             return None
-        value = headers.get(name) if hasattr(headers, "get") else None
-        if value is None and hasattr(headers, "items"):
-            value = next(
-                (item for key, item in headers.items() if str(key).lower() == name.lower()),
-                None,
-            )
-        return str(value).strip() if value is not None else None
-
-    @staticmethod
-    def _error_headers(error: Exception):
-        response = getattr(error, "response", None)
-        return getattr(response, "headers", None) or getattr(error, "headers", None)
-
-    def _chunk_key(self, compact_segments: list[dict], source_duration: float) -> str:
-        payload = json.dumps(
-            {"source_duration": round(source_duration, 2), "timestamped_segments": compact_segments},
-            separators=(",", ":"),
+        return next(
+            (str(value).strip() for key, value in headers.items() if str(key).lower() == name.lower()),
+            None,
         )
-        return hashlib.sha256(
-            f"{CHUNK_CHECKPOINT_VERSION}\0{self.model}\0{payload}".encode("utf-8")
-        ).hexdigest()
-
-    @staticmethod
-    def _parse_delay(value: str | None) -> float | None:
-        if not value:
-            return None
-        try:
-            seconds = float(value)
-            return seconds if math.isfinite(seconds) and 0 <= seconds <= 315360000 else None
-        except ValueError:
-            pass
-        try:
-            parsed = parsedate_to_datetime(value)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            seconds = max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
-            return seconds if seconds <= 315360000 else None
-        except (TypeError, ValueError, OverflowError):
-            pass
-
-        factors = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
-        matches = re.findall(r"(\d+(?:\.\d+)?)(ms|h|m|s)", value.lower())
-        if not matches or "".join(number + unit for number, unit in matches) != value.lower().replace(" ", ""):
-            return None
-        seconds = sum(float(number) * factors[unit] for number, unit in matches)
-        return seconds if math.isfinite(seconds) and seconds <= 315360000 else None
 
     @classmethod
-    def _rate_limit_delay(cls, error: Exception, fallback: float = 60.0) -> float:
-        headers = cls._error_headers(error)
-        delays = [
-            cls._parse_delay(cls._header(headers, "retry-after")),
-            cls._parse_delay(cls._header(headers, "x-ratelimit-reset-requests")),
-            cls._parse_delay(cls._header(headers, "x-ratelimit-reset-tokens")),
-        ]
-        usable = [delay for delay in delays if delay is not None]
-        return max(1.0, max(usable)) if usable else fallback
-
-    @staticmethod
-    def _candidate_target(source_duration: float) -> int:
-        if source_duration <= 60:
-            return min(MAX_CLIPS_PER_VIDEO, 3)
-        return min(MAX_CANDIDATE_TARGET, MAX_CLIPS_PER_VIDEO, max(5, math.ceil(source_duration / 300)))
-
-    @staticmethod
-    def _output_token_budget(candidate_count: int) -> int:
-        return min(6000, max(2200, 1800 + candidate_count * 450))
+    def _retry_after(cls, error: Exception) -> float:
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None) or getattr(error, "headers", None)
+        delays = []
+        for name in (
+            "retry-after",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens",
+        ):
+            value = cls._header(headers, name)
+            if not value:
+                continue
+            try:
+                seconds = float(value)
+                if math.isfinite(seconds) and seconds >= 0:
+                    delays.append(seconds)
+                    continue
+            except ValueError:
+                pass
+            match = re.fullmatch(r"(\d+(?:\.\d+)?)(ms|s|m|h)", value.lower())
+            if match:
+                factor = {"ms": 0.001, "s": 1, "m": 60, "h": 3600}[match.group(2)]
+                delays.append(float(match.group(1)) * factor)
+                continue
+            try:
+                parsed = parsedate_to_datetime(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                delays.append((parsed - datetime.now(timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                continue
+        return max(1.0, max(delays)) if delays else float(GROQ_429_FALLBACK_SECONDS)
 
     def _response_format(self) -> dict[str, object]:
         if self.model.lower() in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
@@ -296,111 +306,293 @@ class GroqClient:
             }
         return {"type": "json_object"}
 
-    @staticmethod
-    def _redact_provider_text(value: str, sensitive_texts: list[str]) -> str:
-        text = value
-        for sensitive_text in sorted(sensitive_texts, key=len, reverse=True):
-            if not sensitive_text:
-                continue
-            text = text.replace(sensitive_text, "[redacted]")
-            words = sensitive_text.split()
-            if len(words) > 1:
-                text = re.sub(r"\s+".join(map(re.escape, words)), "[redacted]", text, flags=re.IGNORECASE)
-        text = re.sub(r"\b(?:gsk_[A-Za-z0-9_-]+|sk-[A-Za-z0-9_-]+|Bearer\s+\S+)\b", "[redacted]", text)
-        text = re.sub(
-            r"(?i)\b(?:https?|redis(?:s)?)://[^/\s:@]+:[^@\s/]+@",
-            "[redacted]://",
-            text,
+    def _messages(self, windows: list[dict]) -> list[dict[str, str]]:
+        instructions = (
+            "Evaluate each independent, timestamped transcript window. Return JSON only using the supplied schema. "
+            "For each window, return zero or one strongest genuinely viable, standalone clip; do not invent clips or "
+            "fill a quota. A complete observation, joke, revelation, answer, or explanation may qualify without a "
+            "formal conclusion. Reject incomplete thoughts, context-dependent fragments, questions missing necessary "
+            "answers, and clips that only have an attention-grabbing opening. Judge hook, informational/entertainment "
+            "value, emotional impact, clarity, completeness, quotability, engagement, payoff, context independence, "
+            "efficiency, and natural start/end. Every timestamp must exactly match supplied segment boundaries and "
+            "remain on the original video timeline. Scores are 0-10. Use concise reasons. Empty candidates are valid."
         )
-        return text
+        payload = {
+            "windows": [
+                {
+                    "id": window["id"],
+                    "start": window["start"],
+                    "end": window["end"],
+                    "segments": window["segments"],
+                }
+                for window in windows
+            ],
+        }
+        return [
+            {"role": "system", "content": instructions},
+            {"role": "user", "content": json.dumps(payload, separators=(",", ":"), ensure_ascii=False)},
+        ]
 
-    @staticmethod
-    def _provider_error_code(
-        error: Exception,
-        sensitive_texts: list[str] | None = None,
-    ) -> str | None:
-        body = getattr(error, "body", None)
-        if not isinstance(body, dict):
-            return None
-        details = body.get("error", body)
-        if isinstance(details, dict):
-            code = details.get("code")
-            if code is None:
-                return None
-            return GroqClient._redact_provider_text(str(code), sensitive_texts or [])
-        return None
+    def _output_budget(self, window_count: int) -> int:
+        return min(GROQ_SELECTION_MAX_OUTPUT_TOKENS, max(256, 300 + window_count * 350))
 
-    @staticmethod
-    def _provider_error_details(
-        error: Exception,
-        sensitive_texts: list[str],
-    ) -> dict[str, str]:
-        body = getattr(error, "body", None)
-        if not isinstance(body, dict):
-            return {}
-        details = body.get("error", body)
-        if not isinstance(details, dict):
-            return {}
-
-        result = {}
-        for field in ("message", "type", "param", "details", "validation_error", "errors"):
-            value = details.get(field)
-            if value is None:
-                continue
-            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-            text = GroqClient._redact_provider_text(text, sensitive_texts)
-            result[f"provider_{field}"] = text[:1000]
-        return result
-
-    @staticmethod
-    def _request_diagnostics(
-        *,
-        model: str,
-        chunk_index: int,
+    def _request_token_estimate(
+        self,
         messages: list[dict[str, str]],
         response_format: dict[str, object],
-        candidate_count: int,
-        output_token_budget: int,
-        http_status: int | None,
-        error_code: str | None,
-    ) -> dict[str, object]:
-        serialized_size = len(
-            json.dumps(
-                {"model": model, "messages": messages, "response_format": response_format},
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-        )
-        return {
-            "model": model,
-            "chunk_index": chunk_index,
-            "serialized_input_bytes": serialized_size,
-            "estimated_input_tokens": math.ceil(serialized_size / 4),
-            "candidate_count": candidate_count,
-            "output_token_budget": output_token_budget,
-            "http_status": http_status if http_status is not None else "unknown",
-            "error_code": error_code or "unknown",
+        output_tokens: int,
+    ) -> int:
+        request = {
+            "model": self.model,
+            "messages": messages,
+            "response_format": response_format,
+            "max_tokens": output_tokens,
         }
+        return self._estimate_tokens(json.dumps(request, separators=(",", ":"), ensure_ascii=False)) + output_tokens
+
+    def _batch_windows(self, windows: list[dict]) -> list[list[dict]]:
+        batches: list[list[dict]] = []
+        current: list[dict] = []
+        response_format = self._response_format()
+        pending = list(windows)
+        bounded_windows = []
+        while pending:
+            window = pending.pop(0)
+            output_budget = self._output_budget(1)
+            estimated_tokens = self._request_token_estimate(
+                self._messages([window]),
+                response_format,
+                output_budget,
+            )
+            if estimated_tokens <= GROQ_SELECTION_MAX_INPUT_TOKENS:
+                bounded_windows.append(window)
+                continue
+
+            sentences = self._sentence_groups(
+                window["segments"],
+                max_duration=GROQ_SELECTION_MAX_DURATION_SECONDS,
+            )
+            if len(sentences) < 2:
+                logger.warning(
+                    "Groq candidate window skipped because one transcript sentence exceeds the request budget window_id=%s estimated_tokens=%d limit=%d",
+                    window["id"],
+                    estimated_tokens,
+                    GROQ_SELECTION_MAX_INPUT_TOKENS,
+                )
+                continue
+
+            split_at = len(sentences) // 2
+            right_start = sentences[split_at][0]["s"]
+            overlap_start = right_start - GROQ_SELECTION_CHUNK_OVERLAP_SECONDS
+            right_start_index = split_at
+            while (
+                right_start_index > 0
+                and sentences[right_start_index - 1][-1]["e"] > overlap_start
+            ):
+                right_start_index -= 1
+            if right_start_index == 0:
+                right_start_index = split_at
+
+            left_segments = [segment for group in sentences[:split_at] for segment in group]
+            right_segments = [segment for group in sentences[right_start_index:] for segment in group]
+            left = {
+                **window,
+                "id": f"{window['id']}.a",
+                "identity": f"{left_segments[0]['s']:.3f}:{left_segments[-1]['e']:.3f}",
+                "start": left_segments[0]["s"],
+                "end": left_segments[-1]["e"],
+                "segments": left_segments,
+            }
+            right = {
+                **window,
+                "id": f"{window['id']}.b",
+                "identity": f"{right_segments[0]['s']:.3f}:{right_segments[-1]['e']:.3f}",
+                "start": right_segments[0]["s"],
+                "end": right_segments[-1]["e"],
+                "segments": right_segments,
+            }
+            pending[0:0] = [left, right]
+            logger.info(
+                "splitting oversized transcript window at sentence boundary window_id=%s left_segments=%d right_segments=%d",
+                window["id"],
+                len(left_segments),
+                len(right_segments),
+            )
+
+        for window in bounded_windows:
+            proposed = current + [window]
+            messages = self._messages(proposed)
+            output_budget = self._output_budget(len(proposed))
+            estimated_tokens = self._request_token_estimate(messages, response_format, output_budget)
+            if current and (
+                len(proposed) > GROQ_SELECTION_BATCH_SIZE
+                or estimated_tokens > GROQ_SELECTION_MAX_INPUT_TOKENS
+            ):
+                batches.append(current)
+                current = [window]
+            else:
+                current = proposed
+
+            if not current:
+                continue
+            single_messages = self._messages(current)
+            single_output_budget = self._output_budget(len(current))
+            single_estimate = self._request_token_estimate(
+                single_messages,
+                response_format,
+                single_output_budget,
+            )
+            if len(current) == 1 and single_estimate > GROQ_SELECTION_MAX_INPUT_TOKENS:
+                logger.warning(
+                    "Groq candidate window skipped because its bounded request is too large window_id=%s estimated_tokens=%d limit=%d",
+                    window["id"],
+                    single_estimate,
+                    GROQ_SELECTION_MAX_INPUT_TOKENS,
+                )
+                current = []
+        if current:
+            batches.append(current)
+        return batches
+
+    def _batch_key(self, windows: list[dict], source_duration: float) -> str:
+        payload = {
+            "version": CHECKPOINT_VERSION,
+            "model": self.model,
+            "source_duration": round(source_duration, 3),
+            "windows": [
+                {
+                    "identity": window["identity"],
+                    "segments": window["segments"],
+                }
+                for window in windows
+            ],
+        }
+        return hashlib.sha256(
+            json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
 
     @staticmethod
-    def _assert_candidate_grounding(
+    def _validate_grounding(
         candidates: list[GroqCandidateOutput],
-        compact_segments: list[dict],
-        candidate_limit: int,
+        windows: list[dict],
+        source_duration: float,
     ) -> None:
-        if len(candidates) > candidate_limit:
-            raise ValueError("response exceeded the requested candidate count")
-        valid_starts = {segment["s"] for segment in compact_segments}
-        valid_ends = {segment["e"] for segment in compact_segments}
+        by_id = {window["id"]: window for window in windows}
+        seen_window_ids = set()
         for candidate in candidates:
-            if candidate.end <= candidate.start:
-                raise ValueError("candidate end must be greater than start")
-            if round(candidate.start, 2) not in valid_starts:
-                raise ValueError("candidate start is not a supplied transcript timestamp")
-            if round(candidate.end, 2) not in valid_ends:
-                raise ValueError("candidate end is not a supplied transcript timestamp")
-            if candidate.semantic_metadata is None:
-                raise ValueError("candidate is missing required semantic metadata")
+            window = by_id.get(candidate.window_id)
+            if window is None:
+                raise ValueError("candidate referenced an unknown transcript window")
+            if candidate.window_id in seen_window_ids:
+                raise ValueError("response returned multiple candidates for one transcript window")
+            seen_window_ids.add(candidate.window_id)
+            valid_starts = {segment["s"] for segment in window["segments"]}
+            valid_ends = {segment["e"] for segment in window["segments"]}
+            if (
+                candidate.start not in valid_starts
+                or candidate.end not in valid_ends
+                or candidate.start < window["start"]
+                or candidate.end > window["end"]
+                or candidate.end > source_duration
+                or candidate.end <= candidate.start
+            ):
+                raise ValueError("candidate timestamps are not grounded in the supplied original timeline")
+
+    def _invoke(
+        self,
+        windows: list[dict],
+        source_duration: float,
+        batch_index: int,
+    ) -> GroqCandidates:
+        messages = self._messages(windows)
+        response_format = self._response_format()
+        output_budget = self._output_budget(len(windows))
+        estimated_tokens = self._request_token_estimate(messages, response_format, output_budget)
+        if estimated_tokens > GROQ_SELECTION_MAX_INPUT_TOKENS:
+            raise GroqOutputError("Groq selection request has an invalid configured token budget")
+
+        limiter = getattr(self, "rate_limiter", None)
+        if limiter is not None:
+            wait_seconds = limiter.acquire(estimated_tokens)
+            if wait_seconds > 0:
+                raise GroqRateLimitError(wait_seconds, {"shared_limiter_wait_seconds": f"{wait_seconds:.3f}"})
+
+        for attempt in range(MAX_SELECTION_ATTEMPTS):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    temperature=0,
+                    max_tokens=output_budget,
+                    response_format=response_format,
+                    messages=messages,
+                )
+            except Exception as error:
+                status = getattr(error, "status_code", None)
+                if status == 429:
+                    delay = self._retry_after(error)
+                    if limiter is not None:
+                        limiter.defer_all_workers(delay)
+                    logger.warning(
+                        "Groq rate limit response batch=%d retry_after_seconds=%.2f estimated_tokens=%d",
+                        batch_index,
+                        delay,
+                        estimated_tokens,
+                    )
+                    raise GroqRateLimitError(delay) from None
+                if status == 413:
+                    raise GroqOutputError("Groq rejected an invalid oversized request (HTTP 413)") from error
+
+                transient = (
+                    status in {408, 409, 425}
+                    or (isinstance(status, int) and status >= 500)
+                    or isinstance(error, (TimeoutError, ConnectionError))
+                    or type(error).__name__ in {"APIConnectionError", "APITimeoutError"}
+                )
+                logger.warning(
+                    "Groq selection request failed batch=%d attempt=%d status=%s transient=%s estimated_tokens=%d",
+                    batch_index,
+                    attempt + 1,
+                    status or "unknown",
+                    transient,
+                    estimated_tokens,
+                )
+                body = getattr(error, "body", None)
+                details = body.get("error", body) if isinstance(body, dict) else {}
+                provider_code = details.get("code") if isinstance(details, dict) else None
+                if (
+                    status == 400
+                    and provider_code == "json_validate_failed"
+                    and response_format.get("type") == "json_schema"
+                    and attempt + 1 < MAX_SELECTION_ATTEMPTS
+                ):
+                    response_format = {"type": "json_object"}
+                    continue
+                if status == 400 and provider_code == "json_validate_failed":
+                    raise GroqOutputError(
+                        "Groq rejected the structured selection response format"
+                    ) from error
+                if transient and attempt + 1 < MAX_SELECTION_ATTEMPTS:
+                    time.sleep(min(0.5 * (2**attempt), 4.0) + random.uniform(0.0, 0.25))
+                    continue
+                raise
+
+            try:
+                content = response.choices[0].message.content or ""
+                parsed = GroqCandidates.model_validate_json(content)
+                self._validate_grounding(parsed.candidates, windows, source_duration)
+                return parsed
+            except (AttributeError, IndexError, TypeError, ValueError) as error:
+                logger.warning(
+                    "Groq structured output validation failed batch=%d attempt=%d code=malformed_or_ungrounded_output",
+                    batch_index,
+                    attempt + 1,
+                )
+                if attempt + 1 >= MAX_SELECTION_ATTEMPTS:
+                    raise GroqOutputError(
+                        f"Groq returned malformed or ungrounded structured output after {attempt + 1} attempts"
+                    ) from error
+                time.sleep(min(0.25 * (2**attempt), 2.0) + random.uniform(0.0, 0.15))
+        raise AssertionError("bounded Groq attempt loop completed unexpectedly")
 
     def evaluate_transcript(
         self,
@@ -408,234 +600,118 @@ class GroqClient:
         segments: list[dict],
         source_duration: float,
         *,
+        job_id: str | None = None,
         cached_chunks: dict[str, list[dict]] | None = None,
         on_chunk_complete: Callable[[dict[str, list[dict]], int, int], None] | None = None,
     ) -> GroqCandidates:
-        segment_chunks = self._chunk_segments(segments)
-        if not segment_chunks:
-            raise ValueError("transcript contains no timestamped segments")
-        target_count = self._candidate_target(source_duration)
-        candidates_per_chunk = min(
-            MAX_CANDIDATES_PER_CHUNK,
-            max(1, math.ceil(target_count / len(segment_chunks))),
+        started = time.monotonic()
+        if not math.isfinite(source_duration) or source_duration <= 0:
+            raise ValueError("source video duration must be a finite positive number")
+        valid_segments = self._normalize_segments(segments, source_duration)
+        windows = self._candidate_windows(valid_segments, source_duration)
+        batches = self._batch_windows(windows)
+        logger.info(
+            "Groq clip selection started job_id=%s source_duration_seconds=%.3f transcript_segments=%d transcript_windows=%d batches=%d",
+            job_id or "unknown",
+            source_duration,
+            len(valid_segments),
+            len(windows),
+            len(batches),
         )
-        score_fields = "hook,value,emotional_impact,clarity,story_completeness,quotability,engagement_potential,payoff,context_independence,clip_efficiency"
-        example_shape = json.dumps(
-            {
-                "candidates": [{
-                    "start": 0,
-                    "end": 1,
-                    "reason": "brief",
-                    "scores": {field: 0 for field in score_fields.split(",")},
-                    "semantic_metadata": {
-                        "is_complete_thought": True,
-                        "ends_on_sentence_boundary": True,
-                        "contains_conclusion_or_answer": True,
-                        "has_enough_context": True,
-                        "natural_pause_detected": True,
-                    },
-                }],
-            },
-            separators=(",", ":"),
-        )
-        if source_duration <= 15:
-            target_window = "short videos: aim for about 6-12 seconds"
-        elif source_duration <= 60:
-            target_window = "medium videos: aim for about 12-22 seconds"
-        elif source_duration <= 180:
-            target_window = "longer videos: aim for about 18-35 seconds"
-        else:
-            target_window = "very long videos: aim for about 22-60 seconds"
+        if not batches:
+            logger.info(
+                "Groq clip selection completed job_id=%s viable_candidates=0 reason=no_timestamped_candidate_windows duration_seconds=%.3f",
+                job_id or "unknown",
+                time.monotonic() - started,
+            )
+            return GroqCandidates(candidates=[])
 
-        aggregated = []
-        chunk_keys = {self._chunk_key(chunk, source_duration) for chunk in segment_chunks}
-        successful_chunks = {
+        successful_batches = {
             key: value
             for key, value in (cached_chunks or {}).items()
-            if key in chunk_keys
+            if isinstance(key, str) and isinstance(value, list)
         }
-        for chunk_index, compact_segments in enumerate(segment_chunks, 1):
-            window_start = compact_segments[0]["s"]
-            window_end = compact_segments[-1]["e"]
-            payload = json.dumps(
-                {"source_duration": round(source_duration, 2), "timestamped_segments": compact_segments},
-                separators=(",", ":"),
+        candidates: list[GroqCandidateOutput] = []
+        successful_count = 0
+        failed_count = 0
+
+        def process_batch(batch: list[dict], batch_index: int) -> list[GroqCandidateOutput]:
+            nonlocal successful_count, failed_count
+            key = self._batch_key(batch, source_duration)
+            if key in successful_batches:
+                cached = GroqCandidates.model_validate({"candidates": successful_batches[key]})
+                self._validate_grounding(cached.candidates, batch, source_duration)
+                successful_count += 1
+                return cached.candidates
+            if len(batch) > 1:
+                midpoint = len(batch) // 2
+                left_key = self._batch_key(batch[:midpoint], source_duration)
+                right_key = self._batch_key(batch[midpoint:], source_duration)
+                if left_key in successful_batches and right_key in successful_batches:
+                    return (
+                        process_batch(batch[:midpoint], batch_index)
+                        + process_batch(batch[midpoint:], batch_index)
+                    )
+
+            try:
+                parsed = self._invoke(batch, source_duration, batch_index)
+            except GroqOutputError as error:
+                if "oversized request" in str(error).lower() and len(batch) > 1:
+                    midpoint = len(batch) // 2
+                    logger.warning(
+                        "splitting oversized Groq selection batch job_id=%s batch=%d windows=%d",
+                        job_id or "unknown",
+                        batch_index,
+                        len(batch),
+                    )
+                    return (
+                        process_batch(batch[:midpoint], batch_index)
+                        + process_batch(batch[midpoint:], batch_index)
+                    )
+                failed_count += 1
+                raise
+
+            serialized_candidates = [item.model_dump(mode="json") for item in parsed.candidates]
+            successful_batches[key] = serialized_candidates
+            successful_count += 1
+            if on_chunk_complete is not None:
+                on_chunk_complete(dict(successful_batches), successful_count, len(batches))
+            logger.info(
+                "Groq selection batch completed job_id=%s batch=%d windows=%d candidates=%d estimated_tokens=%d",
+                job_id or "unknown",
+                batch_index,
+                len(batch),
+                len(parsed.candidates),
+                self._request_token_estimate(
+                    self._messages(batch),
+                    self._response_format(),
+                    self._output_budget(len(batch)),
+                ),
             )
-            chunk_key = self._chunk_key(compact_segments, source_duration)
-            if chunk_key in successful_chunks:
-                parsed = GroqCandidates.model_validate({"candidates": successful_chunks[chunk_key]})
-                self._assert_candidate_grounding(parsed.candidates, compact_segments, MAX_CANDIDATES_PER_CHUNK)
-                aggregated.extend(parsed.candidates)
-                continue
-            last_diagnostics: dict[str, object] | None = None
-            chunk_succeeded = False
+            return parsed.candidates
 
-            for attempt in range(MAX_JSON_GENERATION_ATTEMPTS):
-                request_candidate_count = (
-                    candidates_per_chunk
-                    if attempt == 0
-                    else max(1, math.ceil(candidates_per_chunk / 2))
-                )
-                if attempt == 0:
-                    prompt = (
-                        f"Return valid JSON only. Select no more than {request_candidate_count} self-contained, "
-                        f"distinct clips from transcript window {chunk_index} ({window_start:.2f}-{window_end:.2f}s). "
-                        f"The full source duration is {source_duration:.2f} seconds; every start/end must be within "
-                        f"0 and {source_duration:.2f}, and candidates must come from the supplied window. Use this "
-                        f"exact shape: {example_shape}. "
-                        f"Every score is a number from 0 to 10. Do not use arrays for scores. Keep each reason "
-                        f"under 12 words. Use only supplied timestamps. {target_window}. Clip length should scale "
-                        "with source runtime. Never end a clip in the middle of a sentence or thought; extend to "
-                        "finish the thought when the supplied window permits. Prefer natural sentence boundaries, "
-                        "complete thoughts, context, a strong hook, and payoff."
-                    )
-                else:
-                    prompt = (
-                        f"Return JSON only with a candidates array. Select at most {request_candidate_count} "
-                        f"distinct, high-quality clips from window {chunk_index} ({window_start:.2f}-"
-                        f"{window_end:.2f}s), within source duration {source_duration:.2f}s. Use only supplied "
-                        "timestamps; start must equal a supplied segment start and end a supplied segment end. "
-                        f"Each candidate needs start, end, a concise reason, scores with exactly these numeric "
-                        f"0-10 fields: {score_fields}, and semantic_metadata with exactly these five boolean fields: "
-                        "is_complete_thought, ends_on_sentence_boundary, contains_conclusion_or_answer, "
-                        "has_enough_context, natural_pause_detected. Prefer complete, contextual moments with a strong "
-                        "hook and payoff, ending at a natural sentence boundary. "
-                        f"{target_window}. Do not repeat moments."
-                    )
-                messages = [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": payload},
-                ]
-                token_budget = self._output_token_budget(request_candidate_count)
-                response_format = self._response_format()
-                if attempt > 0 and self.model.lower() in {"openai/gpt-oss-20b", "openai/gpt-oss-120b"}:
-                    response_format = {"type": "json_object"}
+        try:
+            for batch_index, batch in enumerate(batches, 1):
+                candidates.extend(process_batch(batch, batch_index))
+        except Exception:
+            logger.error(
+                "Groq clip selection batch failed job_id=%s successful_batches=%d failed_batches=%d total_batches=%d",
+                job_id or "unknown",
+                successful_count,
+                failed_count + 1,
+                len(batches),
+            )
+            raise
 
-                request_tokens = (
-                    self._estimate_tokens(messages[0]["content"])
-                    + self._estimate_tokens(messages[1]["content"])
-                    + token_budget
-                )
-                limiter = getattr(self, "rate_limiter", None)
-                if limiter is not None:
-                    wait_seconds = limiter.acquire(request_tokens)
-                    if wait_seconds > 0:
-                        raise GroqRateLimitError(wait_seconds, {"shared_limiter_wait_seconds": f"{wait_seconds:.3f}"})
-
-                try:
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        temperature=0,
-                        max_tokens=token_budget,
-                        response_format=response_format,
-                        messages=messages,
-                    )
-                except Exception as error:
-                    status = getattr(error, "status_code", None)
-                    sensitive_texts = [
-                        transcript,
-                        getattr(self, "_api_key", ""),
-                        os.getenv("GROQ_API_KEY", ""),
-                        *(str(segment.get("text", "")) for segment in segments),
-                    ]
-                    error_code = self._provider_error_code(error, sensitive_texts)
-                    provider_details = self._provider_error_details(
-                        error,
-                        sensitive_texts,
-                    )
-                    diagnostics = self._request_diagnostics(
-                        model=self.model,
-                        chunk_index=chunk_index,
-                        messages=messages,
-                        response_format=response_format,
-                        candidate_count=request_candidate_count,
-                        output_token_budget=token_budget,
-                        http_status=status,
-                        error_code=error_code,
-                    )
-                    diagnostics.update(provider_details)
-                    logger.warning("Groq completion request failed diagnostics=%s", diagnostics)
-                    last_diagnostics = diagnostics
-
-                    if status == 429:
-                        from core.config import GROQ_429_FALLBACK_SECONDS
-
-                        delay = self._rate_limit_delay(error, GROQ_429_FALLBACK_SECONDS)
-                        if limiter is not None:
-                            limiter.defer_all_workers(delay)
-                        details = {
-                            key: value
-                            for key, value in diagnostics.items()
-                            if key.startswith("provider_") or key in {"http_status", "error_code"}
-                        }
-                        headers = self._error_headers(error)
-                        for header in (
-                            "retry-after",
-                            "x-ratelimit-limit-requests",
-                            "x-ratelimit-remaining-requests",
-                            "x-ratelimit-reset-requests",
-                            "x-ratelimit-limit-tokens",
-                            "x-ratelimit-remaining-tokens",
-                            "x-ratelimit-reset-tokens",
-                        ):
-                            value = self._header(headers, header)
-                            if value is not None:
-                                details[f"provider_header_{header}"] = value[:200]
-                        raise GroqRateLimitError(delay, details) from None
-                    if status == 413:
-                        raise GroqOutputError(
-                            f"Groq request payload too large (HTTP 413; {diagnostics})"
-                        ) from error
-                    if (
-                        status == 400
-                        and error_code == "json_validate_failed"
-                        and attempt == 0
-                        and response_format.get("type") == "json_schema"
-                    ):
-                        continue
-                    if status == 400 and error_code == "json_validate_failed":
-                        break
-                    raise
-
-                content = response.choices[0].message.content or ""
-                try:
-                    parsed = GroqCandidates.model_validate_json(content)
-                    self._assert_candidate_grounding(
-                        parsed.candidates,
-                        compact_segments,
-                        request_candidate_count,
-                    )
-                except (ValueError, TypeError) as error:
-                    validation_error_code = "malformed_or_invalid_candidate_json"
-                    diagnostics = self._request_diagnostics(
-                        model=self.model,
-                        chunk_index=chunk_index,
-                        messages=messages,
-                        response_format=response_format,
-                        candidate_count=request_candidate_count,
-                        output_token_budget=token_budget,
-                        http_status=200,
-                        error_code=validation_error_code,
-                    )
-                    logger.warning("Groq response validation failed diagnostics=%s", diagnostics)
-                    last_diagnostics = diagnostics
-                    if attempt == 0:
-                        continue
-                    break
-
-                aggregated.extend(parsed.candidates)
-                successful_chunks[chunk_key] = [
-                    candidate.model_dump(mode="json") for candidate in parsed.candidates
-                ]
-                if on_chunk_complete is not None:
-                    on_chunk_complete(dict(successful_chunks), chunk_index, len(segment_chunks))
-                chunk_succeeded = True
-                break
-            else:
-                raise AssertionError("Groq response attempt loop completed unexpectedly")
-
-            if not chunk_succeeded:
-                raise GroqOutputError(
-                    f"Groq output failure after bounded recovery ({last_diagnostics or {}})"
-                )
-        return GroqCandidates(candidates=aggregated)
+        logger.info(
+            "Groq clip selection completed job_id=%s transcript_segments=%d transcript_windows=%d batches=%d successful_batches=%d failed_batches=%d proposed_candidates=%d duration_seconds=%.3f",
+            job_id or "unknown",
+            len(valid_segments),
+            len(windows),
+            len(batches),
+            successful_count,
+            failed_count,
+            len(candidates),
+            time.monotonic() - started,
+        )
+        return GroqCandidates(candidates=candidates)

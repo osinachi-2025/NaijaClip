@@ -21,23 +21,23 @@ MAX_SENTENCE_EXTENSION_GAP_SECONDS = 2.5
 class CandidateScores(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    hook: float = Field(ge=0, le=10)
-    value: float = Field(ge=0, le=10)
-    emotional_impact: float = Field(ge=0, le=10)
-    clarity: float = Field(ge=0, le=10)
-    story_completeness: float = Field(ge=0, le=10)
-    quotability: float = Field(ge=0, le=10)
-    engagement_potential: float = Field(ge=0, le=10)
-    payoff: float = Field(ge=0, le=10)
-    context_independence: float = Field(ge=0, le=10)
-    clip_efficiency: float = Field(ge=0, le=10)
+    hook: float = Field(ge=0, le=10, allow_inf_nan=False)
+    value: float = Field(ge=0, le=10, allow_inf_nan=False)
+    emotional_impact: float = Field(ge=0, le=10, allow_inf_nan=False)
+    clarity: float = Field(ge=0, le=10, allow_inf_nan=False)
+    story_completeness: float = Field(ge=0, le=10, allow_inf_nan=False)
+    quotability: float = Field(ge=0, le=10, allow_inf_nan=False)
+    engagement_potential: float = Field(ge=0, le=10, allow_inf_nan=False)
+    payoff: float = Field(ge=0, le=10, allow_inf_nan=False)
+    context_independence: float = Field(ge=0, le=10, allow_inf_nan=False)
+    clip_efficiency: float = Field(ge=0, le=10, allow_inf_nan=False)
 
 
 class ClipCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    start: float = Field(ge=0)
-    end: float = Field(gt=0)
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(gt=0, allow_inf_nan=False)
     reason: str = Field(min_length=1)
     scores: CandidateScores
 
@@ -69,14 +69,33 @@ class ClipSemanticMetadata(BaseModel):
     natural_pause_detected: bool = Field(default=True)
 
 
+class GroqSemanticMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    is_complete_thought: bool
+    ends_on_sentence_boundary: bool
+    contains_conclusion_or_answer: bool
+    has_enough_context: bool
+    natural_pause_detected: bool
+
+
 class GroqCandidateOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    start: float = Field(ge=0)
-    end: float = Field(gt=0)
+    window_id: str = Field(min_length=1)
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float = Field(gt=0, allow_inf_nan=False)
     reason: str = Field(min_length=1)
     scores: CandidateScores
-    semantic_metadata: ClipSemanticMetadata | None = None
+    semantic_metadata: GroqSemanticMetadata
+
+    @field_validator("end")
+    @classmethod
+    def end_after_start(cls, value: float, info):
+        start = info.data.get("start")
+        if start is not None and value <= start:
+            raise ValueError("end must be greater than start")
+        return value
 
     @field_validator("scores", mode="before")
     @classmethod
@@ -174,7 +193,7 @@ def _candidate_has_complete_thought(candidate: ClipCandidate, segments: list[dic
 
     next_segment = next((segment for segment in segments if segment["start"] >= last_segment["end"]), None)
     if next_segment is None:
-        return True
+        return _sentence_complete(last_segment.get("text"))
 
     gap = next_segment["start"] - last_segment["end"]
     return gap >= NATURAL_SPEECH_PAUSE_SECONDS and not _continues_thought(
@@ -214,8 +233,9 @@ def _semantic_completion_metadata(candidate: ClipCandidate, source_duration: flo
 
     complete_thought = _candidate_has_complete_thought(candidate, segments)
     next_gap = next_segment["start"] - last_segment["end"] if next_segment else float("inf")
-    natural_break = next_segment is None or (
-        next_gap >= NATURAL_SPEECH_PAUSE_SECONDS
+    natural_break = _sentence_complete(last_segment.get("text")) or (
+        next_segment is not None
+        and next_gap >= NATURAL_SPEECH_PAUSE_SECONDS
         and not _continues_thought(last_segment.get("text"), next_segment.get("text"))
     )
     ends_on_sentence_boundary = _sentence_complete(last_segment.get("text")) or natural_break
